@@ -187,6 +187,7 @@ void (*g_titleUpdate_orig)(TitleScreen*)   = 0;
 void startNetworking();
 void coopUiConnect(bool isHost, bool useSteam, unsigned long long peerId);
 void coopUiDisconnect();
+void coopUiToggleNametag(bool show);
 
 // Log to BOTH our dedicated per-line-flushed file (what the test runner reads)
 // and the engine's kenshi.log (handy when attached live).
@@ -728,6 +729,7 @@ void coopPanelDrive(GameWorld* gw) {
     ps.peerPresent  = g_peerPresent;
     ps.isHost       = g_cfg.isHost;
     ps.transportSel = (g_cfg.transport == "steam") ? 0 : 1;
+    ps.showNametag  = g_cfg.showRemoteNametag;
     std::string detail;
     int ostate;
     if (g_peerPresent) {
@@ -745,7 +747,26 @@ void coopPanelDrive(GameWorld* gw) {
     // US) can fire coopUiConnect; the outbound invite/picker UI is gone.
     coop::steaminvite::tick();
 
-    coop::engine::coopPanelTick(&ps, &coopUiConnect, &coopUiDisconnect);
+    // Remote-player nametag: resolve the co-op peer's Steam persona name and push
+    // it to the replicator so the peer's own driven bodies show WHOSE unit it is.
+    // Shown in NORMAL play now (the F2 "Show player names" toggle / showRemoteNametag
+    // config gates it), no longer only under KENSHICOOP_DEBUG_MARKERS. Steam
+    // transport only - a LAN/UDP session has no SteamID, so the label falls back to
+    // "[Remote Player]". personaName() caches and resolves asynchronously via the
+    // pump above, so this is cheap every tick and self-heals once info lands.
+    unsigned long long nametagPeer = (unsigned long long)coop::steamp2p::peerId();
+    if (nametagPeer == 0) nametagPeer = g_cfg.steamPeer;
+    const char* peerPersona = (g_cfg.transport == "steam" && nametagPeer != 0)
+        ? coop::steaminvite::personaName(nametagPeer) : "";
+    g_repl.setRemoteName(peerPersona);
+    // Push the visibility toggle each tick (the F2 button writes g_cfg via
+    // coopUiToggleNametag; the Replicator shows/hides the labels next tick).
+    g_repl.setShowNametag(g_cfg.showRemoteNametag);
+
+    // Panel now carries the nametag-toggle callback (4-arg signature from the
+    // steam-persona-nametag feature).
+    coop::engine::coopPanelTick(&ps, &coopUiConnect, &coopUiDisconnect,
+                                &coopUiToggleNametag);
 
     // Auto-hide the persistent status banner once it has sat in the connected
     // ("green", ostate == 2) state for a sustained window, so a stable session stops
@@ -768,6 +789,8 @@ void coopPanelDrive(GameWorld* gw) {
     } else {
         s_greenSince = 0;                     // left green: disarm so the banner reappears
     }
+    // Banner visibility now feeds the auto-hide decision (was g_net.isRunning() before
+    // the status-line-autohide feature); the overlay shows/hides on this flag.
     bool showBanner = coop::statusOverlayShown(g_net.isRunning(), s_greenSince,
                                                nowMs, (unsigned long)s_autohideMs);
     coop::engine::coopOverlayTick(gw, detail.c_str(), ostate, showBanner);
@@ -1720,6 +1743,16 @@ void coopUiDisconnect() {
     // World stays live on a manual disconnect: despawn minted proxies before
     // clearing maps so nothing lingers as a duplicate or gets baked into a save.
     sessionResetForUi();
+}
+
+// F2 "Show player names" toggle -> flip the live config. Runtime-only: this is
+// NOT written back to coop_config.json (the whole panel is session-state, same as
+// the Role/Transport/pasted-peer choices). The Replicator reads showRemoteNametag
+// each tick via setShowNametag, so the change is immediate (no reconnect).
+void coopUiToggleNametag(bool show) {
+    g_cfg.showRemoteNametag = show;
+    coopLog(show ? "[coop-ui] show player names -> ON"
+                 : "[coop-ui] show player names -> OFF");
 }
 
 } // namespace
