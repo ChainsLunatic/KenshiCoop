@@ -17,6 +17,31 @@ makes becomes one shared save, streamed to both machines automatically.
 > development. Expect rough edges, desyncs, and crashes. Two players is the
 > current design target.
 
+## Session additions (2026-07-20)
+
+This branch of the fork bundles a batch of fixes and small features on top of
+[nhoral/KenshiCoop](https://github.com/nhoral/KenshiCoop) so two players can run
+all of them together in a single build right now. Each change is also proposed
+individually as an open pull request against nhoral's repository (see the open
+PRs, roughly **#5–#21**, against `nhoral/KenshiCoop`) and is still pending review
+and merge upstream — this combined branch just brings them together for play.
+
+The 13 changes included:
+
+- **Steam persona name tags** — show each player's Steam persona name over their squad.
+- **Bounty / crime sync** — replicate per-character bounty and crime state (host-authoritative).
+- **Per-object crafting authority + symmetric research** — the join now drives the production machines it placed, and researched tech is a grow-only union so a join's research reaches the host.
+- **Shared-wallet money sync from the real source** — money replicates from the authoritative wallet delta instead of a stale snapshot.
+- **Time-aligned locomotion interpolation** — smoother synced movement by aligning interpolation to the peer clock.
+- **World-item duplication mitigation** — reduce dropped-item dupes across the two clients.
+- **Cross-tab control release** — releasing control of a squad tab hands authority over cleanly.
+- **Carried-body self-heal on the join** — fix a join-side carried character being stuck "carried forever".
+- **Per-sender stale-row guards** — symmetric channels drop stale rows per sender instead of clobbering fresh state.
+- **Jail kind-conflict anchor + halt fix** — stop chained/caged captives oscillating and re-seating across clients.
+- **Save-sync bad-CRC deletion** — a save chunk that fails its CRC is discarded and re-fetched rather than kept corrupt.
+- **Status-line auto-hide** — the on-screen co-op status banner fades out once the session is settled.
+- **Build-warnings cleanup** — silence the remaining compiler warnings in the plugin build.
+
 ## How it works
 
 - `KenshiCoop.dll` is loaded into the game by RE_Kenshi. It hooks the engine via
@@ -158,10 +183,13 @@ scenario, and produces a numeric PASS/FAIL verdict from the two logs.
 
 ## Credits
 
+- [nhoral](https://github.com/nhoral) (Mike Cook) - the original **KenshiCoop**
+  project and all of the base co-op work this fork builds on
+- **Lo-Fi Games** - [Kenshi](https://lofigames.com/) itself; none of this exists
+  without their game
 - [BFrizzleFoShizzle](https://github.com/BFrizzleFoShizzle) - RE_Kenshi and
   KenshiLib, which make plugins like this possible
 - [lsalzman/enet](https://github.com/lsalzman/enet) - UDP networking library
-- Lo-Fi Games - Kenshi
 
 ## License
 
