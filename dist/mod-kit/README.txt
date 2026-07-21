@@ -42,8 +42,7 @@ PLAY (Steam - recommended)
      host's save beforehand. If you already have an identical copy on disk it is
      used as-is instead of transferring.)
   5. The white status line shows live state (and a banner over your leader shows
-     it too, in-game - it auto-hides a few seconds after you're solidly
-     connected, see CONTROLS below). Toggle Connection to OFFLINE to leave.
+     it too, in-game). Toggle Connection to OFFLINE to leave.
 
 PLAY (LAN / direct UDP - advanced)
 ----------------------------------

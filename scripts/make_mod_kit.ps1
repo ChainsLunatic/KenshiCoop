@@ -137,7 +137,8 @@ PLAY (Steam - recommended)
   2. Swap Steam IDs: each player clicks "Copy my Steam ID" and sends it to the
      other (Steam chat, Discord, etc.). When you receive your friend's ID, copy
      it, then click "Paste friend's Steam ID" in your panel. The panel shows the
-     ID it captured. (This is per-session - re-paste it if you relaunch Kenshi.)
+     ID it captured. (The last ID you paste is remembered between relaunches, so
+     you only need to do this once per friend.)
   3. HOST: load the save you want to play (or start a new game), set Role: HOST,
      leave Transport on STEAM, and toggle Connection to ONLINE.
   4. JOIN: straight from the MAIN MENU - no save needed - set Role: JOIN, leave
@@ -156,6 +157,30 @@ PLAY (LAN / direct UDP - advanced)
   and go ONLINE. ip/port are re-read whenever you go ONLINE, so no restart is
   needed after an edit.
 
+CONTROLS / GOOD TO KNOW
+-----------------------
+  * F2 opens and closes the Co-op panel (main menu or in-game). No launcher or
+    command line is ever needed.
+  * "Show player names" toggle: the panel has a "Show player names: ON/OFF"
+    button (ON by default). While it is ON, your friend's Steam persona name
+    floats over the units they control on your screen, so you can tell their
+    characters apart from ordinary NPCs at a glance. Switch it OFF for a clean
+    view. If Steam can't supply a name (friend not on your Steam friends list
+    yet, or LAN/UDP transport), the tag falls back to the character's own name,
+    or "[Remote Player]".
+  * Status banner: the banner over your squad leader is colored by connection
+    state - red = offline, yellow = connecting/waiting, green = connected. After
+    about ten seconds solidly connected (green) it auto-hides so it stops
+    cluttering the screen, and reappears the moment the state changes (a
+    disconnect or a reconnect). The white status line in the panel always shows
+    the current state.
+  * Connect/disconnect toast: a brief "Peer connected"/"Peer disconnected"
+    message flashes on-screen right when the network state changes - separate
+    from the status banner above, and it fades on its own after a few seconds.
+  * F3 free camera: toggle a local, client-only free-fly camera - WASD + Q/E
+    (up/down) to fly, arrow keys to look, hold Shift to move faster. Doesn't
+    affect your character or sync to your friend; handy for screenshots/video.
+
 UNINSTALL
 ---------
   Delete <Kenshi>\mods\KenshiCoop. Nothing else is touched.
@@ -170,8 +195,9 @@ TROUBLESHOOTING
     confirm it matches). If "Paste friend's Steam ID" says the clipboard wasn't
     a Steam ID, have your friend re-copy theirs with "Copy my Steam ID". Look for
     '[steam] session ... active=1' in <Kenshi>\KenshiCoop_*.log.
-  * "protocol mismatch": one player has an older/newer build; both should use
-    the same release.
+  * "protocol mismatch" / "version mismatch" (now shown on-screen, not just in
+    the log): one player has an older/newer build; both should use the same
+    release.
 '@ | Set-Content (Join-Path $kitDir "README.txt") -Encoding UTF8
 
 # Provenance: assert the PACKAGED DLL is byte-identical to the canonical build,
