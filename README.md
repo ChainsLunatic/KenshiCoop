@@ -47,6 +47,17 @@ The changes included:
 - **Remembered friend's Steam ID** — the last pasted peer ID persists between relaunches instead of requiring a re-paste every session.
 - **Free camera mode** — a local, client-only free-fly camera (F3 + WASD/Q-E/arrows) for screenshots and video, reimplemented for our target game version.
 
+Reliability fixes added on 2026-07-21:
+
+- **Steam-transport reset on UDP reconnect** — switching a live session from Steam to UDP now clears the stale Steam peer selector, so the link no longer keeps tunnelling over Steam after the panel has been switched to UDP.
+- **3+ player guard counts concurrent peers** — the host-side "third player unsupported" safety guard now fires on the number of *simultaneously* connected joins instead of a monotonic join counter, so a single friend reconnecting after a network drop (CGNAT/flaky link) no longer trips it on every reconnect.
+- **Title-screen join no longer stalls on the host's load** — a joining player evaluates the host's coordinated-load signal (fingerprint the on-disk save, and on a miss request the transfer) directly at the title screen instead of waiting for the save subsystem to come up. This removes a multi-minute stall where a matched load sat unconsumed in the inbound queue while the join sat at the menu; only the actual engine load is deferred until the save subsystem is ready.
+
+> **Tuning (pending in-play validation, not a confirmed fix):** the walk-drive
+> catch-up gain default (`KENSHICOOP_CATCHUP_K`) was lowered from 2.0 to 1.4 to
+> reduce remote-character overshoot on direction changes. This is a feel tweak
+> that still needs a real session to validate and may be re-tuned or reverted.
+
 ## How it works
 
 - `KenshiCoop.dll` is loaded into the game by RE_Kenshi. It hooks the engine via
