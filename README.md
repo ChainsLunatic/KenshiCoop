@@ -89,7 +89,7 @@ panel, so there's no config file to edit and no launcher scripts to run. (A tiny
 
 ### 1. Install the mod
 
-Grab `KenshiCoop-session-2026-07-20.zip` from
+Grab `KenshiCoop-kit.zip` from
 [this fork's latest release](https://github.com/zeroit789/KenshiCoop/releases/latest)
 and unzip it anywhere (both players) - this branch's build, with everything
 listed above included, not the upstream `nhoral/KenshiCoop` release (which
