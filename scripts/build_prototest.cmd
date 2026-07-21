@@ -5,7 +5,8 @@ REM (VC++ 2010) x64 compiler as the plugin so the packed-struct layout under
 REM test is EXACTLY the layout the shipped DLL compiles (that is the point:
 REM prototest locks the wire contract of this toolchain).
 REM
-REM No game/KenshiLib/ENet dependencies - just the CRT.
+REM No game/KenshiLib/ENet dependencies - just the CRT (+ Win32 for Config.cpp's
+REM last-peer file, which resolves next to the module = cwd in this test exe).
 setlocal
 
 set "REPO=%~dp0.."
@@ -34,7 +35,8 @@ cl.exe /nologo /O2 /EHsc /W3 /DWIN32_LEAN_AND_MEAN ^
     "%REPO%\src\prototest\main.cpp" ^
     "%REPO%\src\prototest\savexfer_test.cpp" ^
     "%REPO%\src\plugin\sync\SaveXfer.cpp" ^
-    "%REPO%\src\plugin\sync\Interp.cpp"
+    "%REPO%\src\plugin\sync\Interp.cpp" ^
+    "%REPO%\src\plugin\core\Config.cpp"
 if errorlevel 1 (
     echo prototest build FAILED
     exit /b 1
