@@ -893,8 +893,14 @@ private:
 // chests and machine inventories hold whole ITEMS that fork per-client:
 // protocol 33 syncs the production buffer FLOATS, but the crafted items land
 // in the machine's Building inventory, and shared chests hold the base's
-// real wealth - the container-inventory channel registers exactly ONE
-// container (the leader) today. The probe's DESIGN questions:
+// real wealth. HISTORICAL NOTE: this probe was written when the container
+// channel only carried the single explicitly-registered container
+// (setOwnedContainerHand v1, the leader seed). The store_sync (full) tier
+// below now drives the ~1 Hz storeSync census (Replicator::publishInventories
+// -> engine::enumContainersNear, up to 48 rows), so EVERY complete
+// STORAGE/machine container within the interest-center radius auto-registers
+// as an authored container - not just one. The probe's DESIGN questions
+// (still the measuring stick for that census):
 //   * container census: do STORAGE + machine-class buildings enumerate with
 //     readable inventories on both clients (the CONT rows answer, count/
 //     qty/hash per row - the capacity evidence vs INV_ITEMS_MAX rides the
