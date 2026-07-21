@@ -41,7 +41,8 @@ PLAY (Steam - recommended)
      host's save beforehand. If you already have an identical copy on disk it is
      used as-is instead of transferring.)
   5. The white status line shows live state (and a banner over your leader shows
-     it too, in-game). Toggle Connection to OFFLINE to leave.
+     it too, in-game - it auto-hides a few seconds after you're solidly
+     connected, see CONTROLS below). Toggle Connection to OFFLINE to leave.
 
 PLAY (LAN / direct UDP - advanced)
 ----------------------------------
@@ -50,6 +51,24 @@ PLAY (LAN / direct UDP - advanced)
   "port" if you changed it). In the panel set Transport: UDP, pick Host/Join,
   and go ONLINE. ip/port are re-read whenever you go ONLINE, so no restart is
   needed after an edit.
+
+CONTROLS / GOOD TO KNOW
+-----------------------
+  * F2 opens and closes the Co-op panel (main menu or in-game). No launcher or
+    command line is ever needed.
+  * "Show player names" toggle: the panel has a "Show player names: ON/OFF"
+    button (ON by default). While it is ON, your friend's Steam persona name
+    floats over the units they control on your screen, so you can tell their
+    characters apart from ordinary NPCs at a glance. Switch it OFF for a clean
+    view. If Steam can't supply a name (friend not on your Steam friends list
+    yet, or LAN/UDP transport), the tag falls back to the character's own name,
+    or "[Remote Player]".
+  * Status banner: the banner over your squad leader is colored by connection
+    state - red = offline, yellow = connecting/waiting, green = connected. After
+    about ten seconds solidly connected (green) it auto-hides so it stops
+    cluttering the screen, and reappears the moment the state changes (a
+    disconnect or a reconnect). The white status line in the panel always shows
+    the current state.
 
 UNINSTALL
 ---------

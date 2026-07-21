@@ -115,13 +115,32 @@ in-game, so the joining player doesn't need to load anything first.
    identical copy of the host's save on disk, it's used as-is instead of
    transferring.)
 6. The white status line shows live state (and a banner over your leader shows
-   it too, in-game). Toggle **Connection** to **OFFLINE** to leave.
+   it too, in-game - it auto-hides a few seconds after you're solidly connected,
+   see below). Toggle **Connection** to **OFFLINE** to leave.
 
 **LAN / direct-UDP (advanced):** skip the Steam ID swap. Open
 `<Kenshi>\mods\KenshiCoop\coop_config.json`, set `"transport": "udp"`, and put
 the host's address in `"ip"` / `"port"`. Then in the panel set **Transport: UDP**
 and go ONLINE. The `ip`/`port` are re-read whenever you go ONLINE, so no restart
 is needed after an edit.
+
+### Controls & on-screen info
+
+- **F2** opens and closes the Co-op panel. It works at the main menu and in-game
+  (as above), so you never need a launcher or a command line.
+- **Show player names.** The panel has a **"Show player names: ON/OFF"** toggle
+  (ON by default). While it's ON, your friend's **Steam persona name** floats over
+  the units they control on your screen, so you can tell their characters apart
+  from ordinary NPCs at a glance. Switch it OFF for a clean view. If Steam can't
+  supply a name (your friend isn't on your Steam friends list yet, or you're on
+  the LAN/UDP transport) the tag falls back to the character's own name, or
+  `[Remote Player]`.
+- **Status banner.** The banner over your squad leader is colored by connection
+  state: **red** = offline, **yellow** = connecting/waiting, **green** =
+  connected. Once the session has been solidly connected (green) for about ten
+  seconds it **auto-hides** so it stops cluttering the screen, and pops back the
+  moment the state changes (your friend disconnects, or a reconnect starts). The
+  white status line in the F2 panel always shows the current state.
 
 ### Good to know
 
