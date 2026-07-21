@@ -1635,6 +1635,16 @@ void coopUiConnect(bool isHost, bool useSteam, unsigned long long peerId) {
               g_cfg.ownRanksFromEnv ? "env" : "role");
     b[sizeof(b) - 1] = '\0';
     coopLog(b);
+
+    // Reset the transport selector before re-arming. startNetworking() only ever
+    // *sets* NetLink::steamPeer_ inside its transport=="steam" success branch; it
+    // never clears it. So when the same process switches Steam -> UDP, a stale
+    // steamPeer_ from the prior Steam attempt would survive and NetLink's
+    // `steam = (steamPeer_ != 0)` check would keep tunnelling over Steam even
+    // though the panel now says UDP. Clear it explicitly for the UDP path; the
+    // Steam path re-arms it with the current peer inside startNetworking().
+    if (!useSteam) g_net.setSteamTransport(0);
+
     startNetworking();
 }
 
