@@ -17,30 +17,35 @@ makes becomes one shared save, streamed to both machines automatically.
 > development. Expect rough edges, desyncs, and crashes. Two players is the
 > current design target.
 
-## Session additions (2026-07-20)
+## Session additions
 
 This branch of the fork bundles a batch of fixes and small features on top of
 [nhoral/KenshiCoop](https://github.com/nhoral/KenshiCoop) so two players can run
 all of them together in a single build right now. Each change is also proposed
 individually as an open pull request against nhoral's repository (see the open
-PRs, roughly **#5–#21**, against `nhoral/KenshiCoop`) and is still pending review
+PRs, roughly **#5–#26**, against `nhoral/KenshiCoop`) and is still pending review
 and merge upstream — this combined branch just brings them together for play.
 
-The 13 changes included:
+The changes included:
 
-- **Steam persona name tags** — show each player's Steam persona name over their squad.
+- **Steam persona name tags** — show each player's Steam persona name over their squad, with an F2 toggle to hide it.
 - **Bounty / crime sync** — replicate per-character bounty and crime state (host-authoritative).
 - **Per-object crafting authority + symmetric research** — the join now drives the production machines it placed, and researched tech is a grow-only union so a join's research reaches the host.
-- **Shared-wallet money sync from the real source** — money replicates from the authoritative wallet delta instead of a stale snapshot.
+- **Shared-wallet money sync from the real source** — money replicates from the authoritative wallet delta instead of a stale snapshot, with a fixed clamp-vs-baseline desync edge case.
 - **Time-aligned locomotion interpolation** — smoother synced movement by aligning interpolation to the peer clock.
 - **World-item duplication mitigation** — reduce dropped-item dupes across the two clients.
 - **Cross-tab control release** — releasing control of a squad tab hands authority over cleanly.
 - **Carried-body self-heal on the join** — fix a join-side carried character being stuck "carried forever".
 - **Per-sender stale-row guards** — symmetric channels drop stale rows per sender instead of clobbering fresh state.
 - **Jail kind-conflict anchor + halt fix** — stop chained/caged captives oscillating and re-seating across clients.
-- **Save-sync bad-CRC deletion** — a save chunk that fails its CRC is discarded and re-fetched rather than kept corrupt.
+- **Save-sync bad-CRC deletion + stranded-transfer recovery** — a save chunk that fails its CRC is discarded and re-fetched rather than kept corrupt, and a transfer interrupted mid-flight (e.g. a crash) cleans up on the next launch instead of leaving orphaned state.
 - **Status-line auto-hide** — the on-screen co-op status banner fades out once the session is settled.
 - **Build-warnings cleanup** — silence the remaining compiler warnings in the plugin build.
+- **NPC chase-teleport fix** — pursuers no longer fall out of replication range and hard-snap repeatedly while chasing a fleeing player.
+- **Walk-drive on-stop settle** — tightens the final approach so a driven body doesn't overshoot and rubber-band when its source stops.
+- **On-screen connection errors + connect/disconnect toast** — a protocol mismatch or rejected connection now shows a real message in-game instead of only in the log, and a brief toast marks the moment a peer connects or disconnects.
+- **Remembered friend's Steam ID** — the last pasted peer ID persists between relaunches instead of requiring a re-paste every session.
+- **Free camera mode** — a local, client-only free-fly camera (F3 + WASD/Q-E/arrows) for screenshots and video, reimplemented for our target game version.
 
 ## How it works
 
@@ -104,8 +109,8 @@ in-game, so the joining player doesn't need to load anything first.
 2. **Swap Steam IDs.** Each player clicks **"Copy my Steam ID"** and sends it to
    the other (Steam chat, Discord, ...). When you receive your friend's ID, copy
    it, then click **"Paste friend's Steam ID"** - the panel shows the ID it
-   captured. This is per-session (nothing is written to disk), so re-paste it if
-   you relaunch Kenshi.
+   captured. The last ID you paste is remembered between relaunches, so you
+   only need to do this once per friend, not once per session.
 3. Leave **Transport** on **STEAM**.
 4. **Host:** load the save you want to play (or start a new game), set
    **Role: HOST**, and toggle **Connection** to **ONLINE**.
@@ -141,6 +146,14 @@ is needed after an edit.
   seconds it **auto-hides** so it stops cluttering the screen, and pops back the
   moment the state changes (your friend disconnects, or a reconnect starts). The
   white status line in the F2 panel always shows the current state.
+- **Connect/disconnect toast.** A brief "Peer connected"/"Peer disconnected"
+  message flashes on-screen the moment the network state actually changes -
+  separate from the persistent status banner above, and it fades on its own
+  after a few seconds.
+- **F3 free camera.** Toggle a local, client-only free-fly camera - fly with
+  **WASD** + **Q/E** (up/down), look with the **arrow keys**, hold **Shift** to
+  move faster. Handy for screenshots/video; doesn't affect your character or
+  sync to your friend.
 
 ### Good to know
 
@@ -167,8 +180,9 @@ is needed after an edit.
   captured ID - confirm it matches). If "Paste friend's Steam ID" reports the
   clipboard wasn't a Steam ID, have your friend re-copy theirs. Look for
   `[steam] session ... active=1` in `<Kenshi>\KenshiCoop_*.log`.
-- **"protocol mismatch" in the log** - one of you has an older build; both
-  players should re-install from the same release.
+- **"protocol mismatch" / "version mismatch" on-screen or in the log** - one of
+  you has an older build; both players should re-install from the same
+  release.
 
 The kit's `README.txt` has the full setup + troubleshooting list.
 

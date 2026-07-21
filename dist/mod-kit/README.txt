@@ -32,7 +32,8 @@ PLAY (Steam - recommended)
   2. Swap Steam IDs: each player clicks "Copy my Steam ID" and sends it to the
      other (Steam chat, Discord, etc.). When you receive your friend's ID, copy
      it, then click "Paste friend's Steam ID" in your panel. The panel shows the
-     ID it captured. (This is per-session - re-paste it if you relaunch Kenshi.)
+     ID it captured. (The last ID you paste is remembered between relaunches, so
+     you only need to do this once per friend.)
   3. HOST: load the save you want to play (or start a new game), set Role: HOST,
      leave Transport on STEAM, and toggle Connection to ONLINE.
   4. JOIN: straight from the MAIN MENU - no save needed - set Role: JOIN, leave
@@ -69,6 +70,12 @@ CONTROLS / GOOD TO KNOW
     cluttering the screen, and reappears the moment the state changes (a
     disconnect or a reconnect). The white status line in the panel always shows
     the current state.
+  * Connect/disconnect toast: a brief "Peer connected"/"Peer disconnected"
+    message flashes on-screen right when the network state changes - separate
+    from the status banner above, and it fades on its own after a few seconds.
+  * F3 free camera: toggle a local, client-only free-fly camera - WASD + Q/E
+    (up/down) to fly, arrow keys to look, hold Shift to move faster. Doesn't
+    affect your character or sync to your friend; handy for screenshots/video.
 
 UNINSTALL
 ---------
@@ -84,5 +91,6 @@ TROUBLESHOOTING
     confirm it matches). If "Paste friend's Steam ID" says the clipboard wasn't
     a Steam ID, have your friend re-copy theirs with "Copy my Steam ID". Look for
     '[steam] session ... active=1' in <Kenshi>\KenshiCoop_*.log.
-  * "protocol mismatch": one player has an older/newer build; both should use
-    the same release.
+  * "protocol mismatch" / "version mismatch" (now shown on-screen, not just in
+    the log): one player has an older/newer build; both should use the same
+    release.
