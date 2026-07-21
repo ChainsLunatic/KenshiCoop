@@ -53,6 +53,7 @@ Replicator::Replicator()
       speedMyCombat_(false), speedPeerCombat_(false), speedLastSet_(-1.0f),
       speedSeqOut_(1), speedSeqSeen_(0),
       speedLastSendMs_(0), speedCombatSampleMs_(0), speedCombatHoldMs_(0),
+      speedDeniedEdge_(false),
       spawnSync_(false), spawnPosLogMs_(0),
       spawnMintRadius_(0.0f), censusScanMs_(0),
       moneySync_(true), recruitSync_(true),
@@ -261,6 +262,7 @@ void Replicator::resetSession() {
     speedLastSendMs_  = 0;
     speedCombatSampleMs_ = 0;
     speedCombatHoldMs_ = 0;
+    speedDeniedEdge_  = false; // host-only authority: no pending join-denied toast
     timeSlew_         = 1.0f;
     timeSeqSeen_      = 0;
     timeLastSendMs_   = 0;
