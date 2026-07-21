@@ -38,6 +38,7 @@
 #include "game/EngineScenario.h" // Phase 5a: auto-bake scene builders
 #include "sync/Replicator.h"
 #include "sync/SaveXfer.h"
+#include "sync/LoadGate.h"     // join LOAD_GO evaluate-vs-load policy (title stall fix)
 #ifdef KENSHICOOP_HARNESS
 #include "test/Scenario.h" // scenario runner: Harness/Debug builds only (Phase 1)
 #endif
@@ -118,6 +119,11 @@ struct SessionController {
     std::string  loadXferPending;  // host: save awaiting post-reload transfer (NACK)
     std::string  loadAfterCommit;  // join: save to load once its transfer commits
     coop::u32    loadCommitBase;   // join: savexfer::commitSeq() at NACK time
+    // A matched LOAD_GO (local copy == host's) received while still at the title
+    // screen, whose engine load had to wait for savesReady(). Latched here and
+    // issued once the save subsystem comes up, so evaluating the GO (and, on a
+    // miss, NACKing for the transfer) never blocks on the subsystem. Empty = none.
+    std::string  loadReadyPending; // join: matched save to load once savesReady()
     // Deferred-signal backstop: SaveManager::load only SETS the LOADGAME signal;
     // it can sit unconsumed mid-session. Armed on every coordinated load issue;
     // if the swap hasn't started after the grace window, pump execute() once.
@@ -151,6 +157,7 @@ coop::u32&   g_loadReqId       = g_session.loadReqId;
 std::string& g_loadXferPending = g_session.loadXferPending;
 std::string& g_loadAfterCommit = g_session.loadAfterCommit;
 coop::u32&   g_loadCommitBase  = g_session.loadCommitBase;
+std::string& g_loadReadyPending = g_session.loadReadyPending;
 DWORD&       g_loadPumpArmTick  = g_session.loadPumpArmTick;
 
 // Scenario harness state. Harness/Debug builds only - the shipped Release DLL
@@ -616,20 +623,44 @@ void driveLoadSync(GameWorld* gw) {
         if (!g_cfg.saveSync && coop::savexfer::sending())
             coop::savexfer::tickSend(g_net, g_net.localId());
     } else {
+        // A matched GO that arrived before the save subsystem was ready (title
+        // screen) is loaded here the moment it comes up. Its evaluation - and,
+        // on a miss, its NACK/transfer - already ran when it was received, so the
+        // wait for savesReady() never blocked the transfer path (title stall fix).
+        if (!g_loadReadyPending.empty() && coop::engine::savesReady()) {
+            std::string name = g_loadReadyPending;
+            g_loadReadyPending.clear();
+            char b[144];
+            _snprintf(b, sizeof(b) - 1,
+                      "[load] deferred MATCH ready -> loading '%s'", name.c_str());
+            b[sizeof(b) - 1] = '\0'; coopLog(b);
+            warnIfNoPortraits(name);
+            g_loadAfterCommit.clear();
+            coop::engine::setLoadBypassOnce();
+            if (!coop::engine::loadSave(name))
+                coopErr("[load] deferred coordinated load FAILED to issue");
+        }
+
         // LOAD_GOs: verify our on-disk copy and follow the host.
         std::deque<coop::InboundLoadGo> gos;
         g_inbound.drainLoadGos(gos);
         for (std::deque<coop::InboundLoadGo>::iterator it = gos.begin();
              it != gos.end(); ++it) {
-            if (it->pkt.loadId <= g_loadIdSeen) continue; // stale/duplicate
-            g_loadIdSeen = it->pkt.loadId;
+            if (it->pkt.loadId <= g_loadIdSeen) continue; // stale/duplicate (no disk I/O)
             char name[sizeof(it->pkt.name) + 1];
             memcpy(name, it->pkt.name, sizeof(it->pkt.name));
             name[sizeof(it->pkt.name)] = '\0';
             if (!name[0]) continue;
+            // Fingerprint our on-disk copy (filesystem only - never waits on the
+            // save subsystem) and pick the action. Evaluate BEFORE stamping
+            // g_loadIdSeen so the policy sees the pre-advance seen id.
             coop::u32 fp = coop::savexfer::folderFingerprint(name);
+            coop::sync::LoadGoAction act = coop::sync::decideLoadGo(
+                it->pkt.loadId, g_loadIdSeen, it->pkt.fingerprint, fp,
+                coop::engine::savesReady());
+            g_loadIdSeen = it->pkt.loadId; // handled this GO
             char b[192];
-            if (fp != 0 && fp == it->pkt.fingerprint) {
+            if (act == coop::sync::LOADGO_LOAD_NOW) {
                 // Already in this exact save? A connect-triggered push (host
                 // bakes its current save and announces it) would otherwise
                 // reload the join into the world it is already in - a pointless
@@ -643,6 +674,7 @@ void driveLoadSync(GameWorld* gw) {
                     coop::engine::saveInfo(curp, sizeof(curp), 0, 0);
                     alreadyIn = (curp[0] && _stricmp(curp, name) == 0);
                 }
+                g_loadReadyPending.clear(); // this GO supersedes any deferred one
                 if (alreadyIn) {
                     _snprintf(b, sizeof(b) - 1,
                               "[load] GO id=%u name='%s' fp=%08x MATCH - already loaded, skip",
@@ -660,7 +692,18 @@ void driveLoadSync(GameWorld* gw) {
                     if (!coop::engine::loadSave(name))
                         coopErr("[load] coordinated load FAILED to issue");
                 }
-            } else {
+            } else if (act == coop::sync::LOADGO_DEFER_LOAD) {
+                // Match, but the save subsystem is not up yet (join still at the
+                // title menu). Latch and load once savesReady() flips - do NOT
+                // block here, and do NOT re-NACK a copy we actually have.
+                g_loadReadyPending = name;
+                g_loadAfterCommit.clear();
+                _snprintf(b, sizeof(b) - 1,
+                          "[load] GO id=%u name='%s' fp=%08x MATCH -> deferred (saves not ready)",
+                          it->pkt.loadId, name, fp);
+                b[sizeof(b) - 1] = '\0'; coopLog(b);
+            } else { // LOADGO_NACK_TRANSFER (missing/diverged) - never savesReady-gated
+                g_loadReadyPending.clear(); // a newer GO wants a transfer, not the old match
                 _snprintf(b, sizeof(b) - 1,
                           "[load] GO id=%u name='%s' hostFp=%08x localFp=%08x %s -> NACK (transfer)",
                           it->pkt.loadId, name, it->pkt.fingerprint, fp,
@@ -1506,13 +1549,16 @@ void titleUpdate_hook(TitleScreen* self) {
     // mainLoop_hook (gated on g_gameStarted). Pump the join half FIRST (before
     // the panel) so a GUI fault can never block it. gw is null: processNetEvents
     // only touches it under a gw&& guard, and the JOIN branches of driveSaveSync/
-    // driveLoadSync never deref it. The load path is gated on savesReady():
-    // before then the host's LOAD_GO simply waits in the inbound queue (no NACK
-    // -> no stream yet), and the save-receiver half still commits chunks to disk.
+    // driveLoadSync never deref it. driveLoadSync runs UNGATED here: evaluating
+    // the host's LOAD_GO (fingerprint the on-disk copy, and on a miss NACK to
+    // pull the transfer) is filesystem-only and must not wait on savesReady() -
+    // that wait once stranded the GO in the inbound queue for minutes while the
+    // player sat at the title screen. Only an immediate MATCH-load re-enters the
+    // engine, and driveLoadSync itself defers just that step until savesReady().
     if (g_net.isRunning() && !g_cfg.isHost && !g_gameStarted) {
         processNetEvents(0);
         if (g_cfg.saveSync) driveSaveSync();
-        if (g_cfg.loadSync && coop::engine::savesReady()) driveLoadSync(0);
+        if (g_cfg.loadSync) driveLoadSync(0);
         // F2 panel while the join waits at the menu (guarded; the host's world is
         // the destination, so we skip the config auto-load for a join session).
         coopPanelDriveSeh(0);

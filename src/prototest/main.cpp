@@ -34,6 +34,7 @@
 #include "../plugin/game/EngineFaults.h" // Phase 5c: fault throttle (pure inline)
 #include "../plugin/game/EngineCaps.h"   // Phase 5d: capability registry (pure inline)
 #include "../plugin/sync/ChangeGate.h"   // Phase 6: change-gated send/accept policy
+#include "../plugin/sync/LoadGate.h"     // join LOAD_GO evaluate-vs-load policy
 
 #include <set>
 
@@ -1355,6 +1356,53 @@ static void testChangeGate() {
           gateShouldSend(true, 80001, 80000, 0, 10000, false));
 }
 
+// ---- join LOAD_GO evaluate-vs-load policy (title-screen stall fix) -----------
+
+static void testLoadGoGate() {
+    using namespace coop::sync;
+    std::printf("== load-go gate (join follows host's coordinated load) ==\n");
+
+    // Stale/duplicate: a GO whose id we've already handled is skipped, whatever
+    // its fingerprint or the subsystem state.
+    CHECK("stale GO (id == seen) skipped",
+          decideLoadGo(4, 4, 0x500aab2a, 0x500aab2a, true) == LOADGO_SKIP_STALE);
+    CHECK("old GO (id < seen) skipped",
+          decideLoadGo(3, 5, 0x11111111, 0x11111111, true) == LOADGO_SKIP_STALE);
+
+    // THE BUG (real session log 2026-07-21): host GO id=4 name='autosave2'
+    // hostFp=500aab2a, join has no copy (localFp=0) and is still at the title
+    // menu so savesReady()==false. This MUST NACK to pull the transfer NOW - the
+    // old code gated the whole evaluation on savesReady() and stranded it for
+    // 7.5 minutes. The missing-copy path is independent of savesReady().
+    CHECK("MISSING copy at title (saves NOT ready) -> NACK now (the bug)",
+          decideLoadGo(4, 0, 0x500aab2a, 0x00000000, false) == LOADGO_NACK_TRANSFER);
+    CHECK("MISSING copy (saves ready) -> NACK",
+          decideLoadGo(4, 0, 0x500aab2a, 0x00000000, true) == LOADGO_NACK_TRANSFER);
+
+    // Diverged copy (present but different fingerprint) also NACKs regardless of
+    // the subsystem - we need the host's exact folder either way.
+    CHECK("DIVERGED copy (saves not ready) -> NACK",
+          decideLoadGo(7, 6, 0xaaaaaaaa, 0xbbbbbbbb, false) == LOADGO_NACK_TRANSFER);
+    CHECK("DIVERGED copy (saves ready) -> NACK",
+          decideLoadGo(7, 6, 0xaaaaaaaa, 0xbbbbbbbb, true) == LOADGO_NACK_TRANSFER);
+
+    // Exact match + subsystem ready -> load immediately (both pre-shared the
+    // same save, in-game or title once the menu is up).
+    CHECK("MATCH + saves ready -> load now",
+          decideLoadGo(9, 8, 0x500aab2a, 0x500aab2a, true) == LOADGO_LOAD_NOW);
+
+    // Exact match but subsystem NOT ready yet (title screen, before the save
+    // menu populates) -> defer the load, do NOT re-NACK a copy we already have.
+    CHECK("MATCH + saves not ready -> defer load",
+          decideLoadGo(9, 8, 0x500aab2a, 0x500aab2a, false) == LOADGO_DEFER_LOAD);
+
+    // A zero local fingerprint that happens to equal a zero host fingerprint is
+    // still a MISSING copy, never a match (localFp==0 is the "no folder"
+    // sentinel), so it NACKs rather than "loading" an absent save.
+    CHECK("both fp zero -> treated as MISSING, NACK",
+          decideLoadGo(2, 1, 0x00000000, 0x00000000, true) == LOADGO_NACK_TRANSFER);
+}
+
 int main() {
     std::printf("prototest: KenshiCoop wire/hash/interp unit layer (protocol v%u)\n",
                 (unsigned)PROTOCOL_VERSION);
@@ -1363,6 +1411,7 @@ int main() {
     testEngineFaults();
     testEngineCaps();
     testChangeGate();
+    testLoadGoGate();
     testRoundTrips();
     testFraming();
     testSaveCrc();
