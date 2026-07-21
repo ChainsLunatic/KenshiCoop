@@ -58,6 +58,13 @@ Reliability fixes added on 2026-07-21:
 > reduce remote-character overshoot on direction changes. This is a feel tweak
 > that still needs a real session to validate and may be re-tuned or reverted.
 
+Host-only speed/pause and performance fixes added on 2026-07-21:
+
+- **Host-only game speed and pause authority** — game speed and pause are now driven by the host and mirrored to the join, so the two clients no longer fight over the simulation rate; a join changing speed locally no longer desyncs the session.
+- **Logger flush throttled to ~250 ms** — `CoopLog` flushed the log file on every line while holding the lock shared with the net thread, adding a synchronous disk flush to that critical section on each call. Flushes are now coalesced to roughly every 250 ms; every close/error teardown path still forces an immediate flush, so the "survives a hard kill" property is preserved.
+- **Single `OutputDebugStringA` per net log line** — `netLog`/`netErr` formatted their debugger output with three separate `OutputDebugStringA` calls (prefix, message, newline); they now build one buffer and emit a single call, cutting the debugger-string syscall cost and preventing cross-thread interleaving between the fragments.
+- **De-duplicated publish key-set build** — the owned-entity publish path built the same `keyOf(buf[0..n))` set twice per publish (once for the carried-body sweep, once for the furniture sweep); it is now built once and reused, and only when at least one sweep will actually run.
+
 ## How it works
 
 - `KenshiCoop.dll` is loaded into the game by RE_Kenshi. It hooks the engine via

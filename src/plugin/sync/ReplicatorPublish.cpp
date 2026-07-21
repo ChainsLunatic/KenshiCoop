@@ -485,10 +485,18 @@ void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
     // sphere and the join never saw a DROP). After a short absence debounce
     // (beyond interest-boundary flicker), author the DROP for it here; the
     // peer releases its copy, which then rides the ordinary down channels.
+    // Shared "present in the stream this publish" key set. The carried-body sweep
+    // and the furniture sweep below both need the identical set keyOf(buf[0..n));
+    // it used to be rebuilt independently for each (bufKeys / bufKeys2). Build it
+    // once here and reuse it. Only built when at least one sweep will actually run
+    // (both flags off = no work), and neither sweep mutates buf/n, so one set is
+    // exactly equivalent to the two it replaces.
+    std::set<Key> bufKeys;
+    if (carrySync_ || furnSync_) {
+        for (unsigned int i = 0; i < n; ++i) bufKeys.insert(keyOf(buf[i]));
+    }
     if (carrySync_) {
         const unsigned long CARRY_GONE_MS = 3000;
-        std::set<Key> bufKeys;
-        for (unsigned int i = 0; i < n; ++i) bufKeys.insert(keyOf(buf[i]));
         for (std::map<Key, HostBody>::iterator hit = hostBody_.begin();
              hit != hostBody_.end(); ++hit) {
             HostBody& hb = hit->second;
@@ -522,13 +530,11 @@ void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
     // and the enter edge re-fires (idempotent on the receiver).
     if (furnSync_) {
         const unsigned long FURN_GONE_MS = 3000;
-        std::set<Key> bufKeys2;
-        for (unsigned int i = 0; i < n; ++i) bufKeys2.insert(keyOf(buf[i]));
         for (std::map<Key, HostBody>::iterator hit = hostBody_.begin();
              hit != hostBody_.end(); ++hit) {
             HostBody& hb = hit->second;
             if (hb.furnKind == 0) continue;
-            if (bufKeys2.find(hit->first) != bufKeys2.end()) continue;
+            if (bufKeys.find(hit->first) != bufKeys.end()) continue;
             if (nowPub - hb.seenMs < FURN_GONE_MS) continue;
             const Key& ok = hit->first;
             EventPacket ev; memset(&ev, 0, sizeof(ev));

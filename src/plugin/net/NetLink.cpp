@@ -38,18 +38,25 @@ const enet_uint32 DISCONNECT_VERSION_MISMATCH = 1;
 // Net-thread diagnostics. OutputDebugStringA is thread-safe, and CoopLog guards
 // its FILE* with a lock, so both are safe to call off the main thread.
 void netLog(const char* msg) {
-    OutputDebugStringA("[KenshiCoop/net] ");
-    OutputDebugStringA(msg ? msg : "");
-    OutputDebugStringA("\n");
+    // Format prefix + message + newline into one buffer and emit a SINGLE
+    // OutputDebugStringA call. Three separate calls (prefix, msg, "\n") tripled
+    // the debugger-string syscall cost and could interleave with another
+    // thread's output between the fragments; one call is atomic and cheaper.
+    char dbg[288];
+    _snprintf(dbg, sizeof(dbg) - 1, "[KenshiCoop/net] %s\n", msg ? msg : "");
+    dbg[sizeof(dbg) - 1] = '\0';
+    OutputDebugStringA(dbg);
     char buf[256];
     _snprintf(buf, sizeof(buf) - 1, "[net] %s", msg ? msg : "");
     buf[sizeof(buf) - 1] = '\0';
     coop::logLine(buf);
 }
 void netErr(const char* msg) {
-    OutputDebugStringA("[KenshiCoop/net] ERROR: ");
-    OutputDebugStringA(msg ? msg : "");
-    OutputDebugStringA("\n");
+    // Single OutputDebugStringA call, same rationale as netLog (see above).
+    char dbg[288];
+    _snprintf(dbg, sizeof(dbg) - 1, "[KenshiCoop/net] ERROR: %s\n", msg ? msg : "");
+    dbg[sizeof(dbg) - 1] = '\0';
+    OutputDebugStringA(dbg);
     char buf[256];
     _snprintf(buf, sizeof(buf) - 1, "[net] %s", msg ? msg : "");
     buf[sizeof(buf) - 1] = '\0';
