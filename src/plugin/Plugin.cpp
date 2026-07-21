@@ -870,8 +870,10 @@ void coopPanelDrive(GameWorld* gw) {
     // Ephemeral transition toast: a peer connect/leave edge armed it (armPeerToast);
     // show it until TOAST_SHOW_MS elapses, then disarm so coopToastTick removes the
     // label. Independent of the persistent overlay above (its own label + timer).
+    // Reuses nowMs (same tick instant as the auto-hide decision above) instead of a
+    // second GetTickCount() call.
     bool toastShow = coop::engine::toastVisible(g_toastArmed, g_toastArmMs,
-                                                GetTickCount(), coop::engine::TOAST_SHOW_MS);
+                                                nowMs, coop::engine::TOAST_SHOW_MS);
     if (g_toastArmed && !toastShow) g_toastArmed = false; // window elapsed: retire it
     coop::engine::coopToastTick(gw, g_toastText.c_str(), g_toastState, toastShow);
 }
