@@ -377,6 +377,13 @@ void NetLink::threadLoop() {
     }
 
     u32   nextId = 1;
+    // Number of joins currently holding a live peer slot (host side). Unlike
+    // nextId, which grows monotonically for every admitted join and is never
+    // reset, this rises on admission and falls on disconnect, so it reflects how
+    // many joins are connected AT THE SAME TIME - the real condition the 3+
+    // player guard cares about. A single friend reconnecting after a network
+    // drop must not accumulate here.
+    u32   livePeers = 0;
     DWORD lastConnectAttempt = GetTickCount();
 
     // Wall-clock time-sync state (client only). The join pings every ~2 s; each
@@ -455,13 +462,21 @@ void NetLink::threadLoop() {
                                 enet_peer_disconnect(ev.peer, 0);
                             } else {
                                 u32 id = nextId++;
+                                // This join now occupies a live peer slot. Count
+                                // CONCURRENT joins, not the monotonic id: nextId only
+                                // ever grows, so a single friend reconnecting after a
+                                // network drop (CGNAT/flaky link) used to trip the
+                                // guard below on every reconnect (id 2, 3, 4...) even
+                                // though only one join was ever connected at a time.
+                                ++livePeers;
                                 // TWO-PLAYER ASSUMPTION (step-6 guard): the sync model
                                 // is host + ONE join. Join-authored events/inventory/
                                 // conservation intents reach only the host and are NOT
                                 // relayed to other joins, and OWNER_ID_ALL sweeps assume
-                                // a single peer. A third player connects at the wire
-                                // level but will silently desync - fail loudly instead.
-                                if (id >= 2) {
+                                // a single peer. A second SIMULTANEOUS join (a third
+                                // player total) connects at the wire level but will
+                                // silently desync - fail loudly instead.
+                                if (livePeers >= 2) {
                                     netErr("3+ players unsupported: join-authored state is "
                                            "not relayed peer-to-peer; expect desync");
                                 }
@@ -885,6 +900,11 @@ void NetLink::threadLoop() {
                     if (isHost_) {
                         u32 id = (u32)(size_t)ev.peer->data;
                         ev.peer->data = 0;
+                        // Only admitted joins (id != 0, set after a successful
+                        // HELLO) ever incremented livePeers; peers rejected before
+                        // admission (version mismatch) never did, so don't
+                        // decrement for them. Guard against underflow regardless.
+                        if (id != 0 && livePeers > 0) --livePeers;
                         if (inbound_) inbound_->pushLeave(id);
                         char b[64];
                         _snprintf(b, sizeof(b) - 1, "peer disconnected id=%u", (unsigned)id);
