@@ -555,16 +555,24 @@ public:
     // owner's screen. Never applied to driven copies.
     void applyStealthFeedback(GameWorld* gw, Inbound& in);
 
-    // BEFORE engine (consensus game-speed sync, runs on BOTH clients):
+    // BEFORE engine (host-only game-speed/pause authority, runs on BOTH clients):
     //  * detect a LOCAL user speed click (current state != what WE last applied)
     //    and turn it into a request (pause = speed 0);
     //  * join: send PKT_SPEED_REQ (change-gated + 3 s safety resend) and apply
-    //    any received PKT_SPEED_SET;
-    //  * host: consume its own request locally, drain peer requests, arbitrate
-    //    effective = min(requests) capped at 1x while either player squad is in
-    //    combat (own flag from ownHands_+readCombat, peer flag from its REQ),
-    //    apply locally and broadcast PKT_SPEED_SET on change (+ safety resend).
+    //    any received PKT_SPEED_SET; a local speed/pause action is DENIED (flag
+    //    speedDeniedEdge_ for the toast) and reverted by the enforcement below;
+    //  * host: consume its OWN request locally, arbitrate effective from the
+    //    host's request alone (SpeedGate::effectiveHostSpeed) capped at 1x while
+    //    either player squad is in combat (own flag from ownHands_+readCombat,
+    //    peer combat bit from its REQ), apply locally and broadcast
+    //    PKT_SPEED_SET on change (+ safety resend). The join's REQUEST no longer
+    //    lowers the effective (was min(host, join) consensus).
     void syncSpeed(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerId, bool isHost);
+
+    // Host-only authority feedback: true once after a JOIN tried to change
+    // speed/pause (denied + reverted); clears on read. Plugin polls this to pop
+    // the "only the host can change game speed" toast. Always false on the host.
+    bool consumeSpeedDenied() { bool e = speedDeniedEdge_; speedDeniedEdge_ = false; return e; }
 
     // BEFORE engine, AFTER syncSpeed (protocol 25 game-clock sync):
     //  * host: broadcast the absolute in-game clock (PKT_TIME, ~1 Hz);
@@ -1713,6 +1721,10 @@ private:
     unsigned long speedLastSendMs_;    // last REQ (join) / SET (host) send, safety resend
     unsigned long speedCombatSampleMs_;// last own-combat sample time
     unsigned long speedCombatHoldMs_;  // last time own-squad combat read TRUE (cap hysteresis)
+    // Host-only authority: set true when a JOIN tried to change speed/pause this
+    // tick (its input is denied and reverted). Plugin consumes the edge to pop
+    // the "only the host can change game speed" toast. Always false on the host.
+    bool          speedDeniedEdge_;
 
     // Protocol 25 game-clock sync state. timeSlew_ is the join's correction
     // multiplier (1.0 = no correction); the speed layer applies effective *

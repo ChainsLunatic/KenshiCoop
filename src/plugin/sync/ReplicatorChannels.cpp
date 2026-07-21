@@ -13,6 +13,7 @@
 #include "ReplicatorUtil.h"
 #include "../core/StaleGuard.h"
 #include "../core/ProdAuthority.h" // modelo de autoridad por-objeto (protocolo 33)
+#include "SpeedGate.h"             // host-only speed/pause authority (pure inline)
 
 namespace coop {
 
@@ -1932,12 +1933,18 @@ void Replicator::syncSpeed(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerId
     // reentrancy-guarded and never register. Pause requests as speed 0; the
     // requested multiplier survives a pause (the engine's own model), so
     // unpausing restores the player's request, not the arbitrated effective.
+    // realUserAction stays FALSE for the first-tick seed below (a seed is not a
+    // player pressing a button); only a genuinely consumed intent flips it. It
+    // gates the join's "only the host can change speed" denial toast so a fresh
+    // session never pops the toast just from seeding its baseline.
     bool userActed = false;
+    bool realUserAction = false;
     {
         float im = 0.0f; bool ip = false;
         while (engine::consumeSpeedIntent(gw, &im, &ip)) {
             speedMyReq_ = ip ? 0.0f : im;
             userActed = true;
+            realUserAction = true;
         }
     }
     if (speedMyReq_ < 0.0f) {
@@ -1948,6 +1955,13 @@ void Replicator::syncSpeed(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerId
         speedMyReq_ = paused ? 0.0f : mult;
         userActed = true;
     }
+
+    // Host-only authority: a JOIN's speed/pause action is never authoritative.
+    // Flag the denied edge so Plugin can pop the informational toast; the actual
+    // revert is the continuous enforcement further down (the join's local sim is
+    // snapped back to the host's effective). The host is never denied.
+    if (coop::sync::shouldDenySpeedInput(isHost, realUserAction))
+        speedDeniedEdge_ = true;
     if (userActed) {
         char b[112]; _snprintf(b, sizeof(b) - 1,
             "[speed] REQ mult=%.2f paused=%d combat=%d",
@@ -2000,13 +2014,15 @@ void Replicator::syncSpeed(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerId
     }
 
     if (isHost) {
-        // Arbitrate: effective = min(my request, peer request), capped at 1x
-        // while either player squad fights. The cap never force-unpauses -
-        // pause (0) is already below 1, so min semantics preserve it.
-        float eff = (speedMyReq_ >= 0.0f) ? speedMyReq_ : 1.0f;
-        if (speedPeerReq_ >= 0.0f && speedPeerReq_ < eff) eff = speedPeerReq_;
+        // Host-only authority: the effective is the HOST's OWN request, capped
+        // at 1x while either tracked squad fights (SpeedGate::effectiveHostSpeed).
+        // The join's request (speedPeerReq_) is deliberately NOT folded in - a
+        // join can no longer pause or slow the shared session (was min(host,
+        // join) consensus). speedPeerCombat_ still feeds the combat cap: that is
+        // an automatic balance rule, not the join changing speed. The cap never
+        // force-unpauses - pause (0) is already below 1.
         bool combat = speedMyCombat_ || speedPeerCombat_;
-        if (combat && eff > 1.0f) eff = 1.0f;
+        float eff = coop::sync::effectiveHostSpeed(speedMyReq_, combat);
         bool changed = (speedLastSet_ < 0.0f || fabs(eff - speedLastSet_) > EPS);
         // userActed with an UNCHANGED effective = a denied raise (consensus
         // holdback): re-apply immediately so the host engine doesn't run fast

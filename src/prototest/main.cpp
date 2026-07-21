@@ -46,6 +46,7 @@
 #include "../plugin/core/ProdAuthority.h" // autoridad por-objeto de crafteo (protocolo 33)
 #include "../plugin/sync/DriveTaper.h"    // walk-drive deceleration taper (pure inline)
 #include "../plugin/sync/LoadGate.h"     // join LOAD_GO evaluate-vs-load policy
+#include "../plugin/sync/SpeedGate.h"    // host-only speed/pause authority policy
 
 #include <set>
 
@@ -2110,6 +2111,46 @@ static void testLoadGoGate() {
           decideLoadGo(2, 1, 0x00000000, 0x00000000, true) == LOADGO_NACK_TRANSFER);
 }
 
+// ---- host-only game-speed / pause authority (SpeedGate.h) -------------------
+// Locks the shift from consensus min(host, join) to host-only authority:
+//  * the effective the host applies/broadcasts is the HOST's own request alone,
+//    never lowered by the join (a join can no longer pause/slow the session);
+//  * the combat cap (1x while a tracked squad fights) is preserved and still
+//    honours the peer combat bit - it is a balance rule, not a speed change;
+//  * a non-host that acted is the (only) case that is denied (drives the toast).
+
+static void testSpeedGate() {
+    using namespace coop::sync;
+    std::printf("== speed gate (host-only speed/pause authority) ==\n");
+
+    // Host request is honoured verbatim outside combat (0.25x .. 5x, pause=0).
+    CHECK("host 1x -> 1x",            effectiveHostSpeed(1.0f, false) == 1.0f);
+    CHECK("host 5x -> 5x",           effectiveHostSpeed(5.0f, false) == 5.0f);
+    CHECK("host pause (0) -> 0",     effectiveHostSpeed(0.0f, false) == 0.0f);
+    CHECK("host unsampled (<0) -> 1x", effectiveHostSpeed(-1.0f, false) == 1.0f);
+
+    // THE FIX: the join's request is NOT a parameter - there is no way for a
+    // join to lower the effective. Whatever the join wanted, the host at 5x
+    // stays 5x (old consensus would have dropped to the join's min).
+    CHECK("host 5x is host-only (join cannot lower it)",
+          effectiveHostSpeed(5.0f, false) == 5.0f);
+
+    // Combat cap: forces 1x when a tracked squad fights, but only downward and
+    // NEVER force-unpauses (pause 0 stays 0; a sub-1x host speed is untouched).
+    CHECK("combat caps 5x -> 1x",    effectiveHostSpeed(5.0f, true) == 1.0f);
+    CHECK("combat leaves 1x at 1x",  effectiveHostSpeed(1.0f, true) == 1.0f);
+    CHECK("combat never unpauses",   effectiveHostSpeed(0.0f, true) == 0.0f);
+    CHECK("combat does not raise slow speed",
+          effectiveHostSpeed(0.5f, true) == 0.5f);
+
+    // Denial predicate: only a non-host that actually acted is denied. The host
+    // is always authoritative; an idle join (no action) is not denied.
+    CHECK("host acting is never denied",   !shouldDenySpeedInput(true,  true));
+    CHECK("host idle is never denied",     !shouldDenySpeedInput(true,  false));
+    CHECK("join acting IS denied",          shouldDenySpeedInput(false, true));
+    CHECK("join idle is not denied",       !shouldDenySpeedInput(false, false));
+}
+
 int main() {
     std::printf("prototest: KenshiCoop wire/hash/interp unit layer (protocol v%u)\n",
                 (unsigned)PROTOCOL_VERSION);
@@ -2120,6 +2161,7 @@ int main() {
     testChangeGate();
     testDriveTaper();
     testLoadGoGate();
+    testSpeedGate();
     testRoundTrips();
     testFraming();
     testSaveCrc();

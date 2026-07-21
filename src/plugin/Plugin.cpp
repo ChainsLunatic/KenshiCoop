@@ -194,6 +194,8 @@ bool         g_toastArmed = false; // a transition toast is currently timed
 DWORD        g_toastArmMs = 0;     // GetTickCount at the arming edge
 std::string  g_toastText;          // "Peer connected" / "Peer disconnected"
 int          g_toastState = 0;     // overlay colour state (2 = green, 0 = red)
+DWORD        g_speedDenyToastMs = 0; // last "only the host" toast (join speed-deny throttle)
+const DWORD  SPEED_DENY_TOAST_COOLDOWN_MS = 2000; // don't re-arm the deny toast every click
 
 // Arm the ephemeral toast for a peer transition. connected=true -> green
 // "Peer connected"; false -> red "Peer disconnected". Records the wall clock so
@@ -201,6 +203,16 @@ int          g_toastState = 0;     // overlay colour state (2 = green, 0 = red)
 void armPeerToast(bool connected) {
     g_toastText  = connected ? "Peer connected" : "Peer disconnected";
     g_toastState = connected ? 2 : 0;
+    g_toastArmMs = GetTickCount();
+    g_toastArmed = true;
+}
+
+// Arm the ephemeral toast with an arbitrary informational message (host-only
+// speed authority feedback). Same timing/plumbing as armPeerToast; state picks
+// the overlay colour (0 = red/attention, 2 = green).
+void armInfoToast(const char* text, int state) {
+    g_toastText  = text;
+    g_toastState = state;
     g_toastArmMs = GetTickCount();
     g_toastArmed = true;
 }
@@ -1266,12 +1278,26 @@ void tickReplicatePublish(GameWorld* gw, bool worldLive) {
                 g_repl.publishStealth(gw, g_net, g_net.localId());
             g_repl.applyStealthFeedback(gw, g_inbound);
         }
-        // Consensus game-speed sync: detect local speed clicks as REQUESTS,
-        // host arbitrates effective = min(requests) (capped at 1x while either
-        // player squad fights) and broadcasts; the join applies the SET. Runs
-        // after publishOwned (the combat flag samples the ownHands_ set).
-        if (g_cfg.speedSync)
+        // Host-only game-speed/pause authority: detect local speed clicks, but
+        // only the HOST's request drives the effective (capped at 1x while
+        // either player squad fights); the join applies the host's SET and its
+        // own speed/pause input is reverted. Runs after publishOwned (the combat
+        // flag samples the ownHands_ set).
+        if (g_cfg.speedSync) {
             g_repl.syncSpeed(gw, g_inbound, g_net, g_net.localId(), g_cfg.isHost);
+            // A JOIN that tried to change speed/pause was denied and reverted -
+            // tell the player instead of silently swallowing the input. Consume
+            // the edge unconditionally (clears it); throttle the actual toast so
+            // a burst of clicks doesn't re-arm every frame.
+            if (!g_cfg.isHost) {
+                bool denied = g_repl.consumeSpeedDenied();
+                DWORD tnow = GetTickCount();
+                if (denied && (tnow - g_speedDenyToastMs) > SPEED_DENY_TOAST_COOLDOWN_MS) {
+                    armInfoToast("Only the host can change game speed", 0);
+                    g_speedDenyToastMs = tnow;
+                }
+            }
+        }
         // Phase 6 (6a evidence spike): env-gated ([shackledbg]) per-character
         // shackle/lock trace. No-op unless KENSHICOOP_DEBUG_SHACKLE=1, so it is
         // free to leave in the tick for manual-session characterization.

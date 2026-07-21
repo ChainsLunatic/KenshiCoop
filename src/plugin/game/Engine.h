@@ -1740,7 +1740,8 @@ bool writeGameSpeed(GameWorld* gw, float mult, bool paused);
 // GameWorld::setFrameSpeedMultiplier + userPause WITHOUT updating the UI speed
 // buttons and WITHOUT registering as user intent (reentrancy-guarded against
 // the intent hooks). The buttons keep showing the player's last click (their
-// VOTE); the replicator enforces the arbitrated min(host, join) underneath.
+// VOTE); the replicator enforces the host-authoritative effective underneath
+// (host-only authority: a join's click is reverted to the host's speed).
 bool writeGameSpeedQuiet(GameWorld* gw, float mult, bool paused);
 
 // Speed-intent capture (the vote source). Two complementary detectors,
