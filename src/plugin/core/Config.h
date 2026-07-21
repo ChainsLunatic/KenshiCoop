@@ -61,7 +61,7 @@ struct Config {
     unsigned int interpMaxExtrapMs; // KENSHICOOP_INTERP_MAX_EXTRAP_MS (250)
     unsigned int interpStaleMs;     // KENSHICOOP_INTERP_STALE_MS      (2000)
     float        interpSnapDist;    // KENSHICOOP_INTERP_SNAP_DIST     (50 u)
-    float        catchupK;          // KENSHICOOP_CATCHUP_K            (2.0)
+    float        catchupK;          // KENSHICOOP_CATCHUP_K            (1.4)
     float        snapDist;          // KENSHICOOP_SNAP_DIST            (8 u)
     float        snapSeconds;       // KENSHICOOP_SNAP_SECONDS         (0.75 s)
                                     // velocity-aware hard-snap gate: teleport a

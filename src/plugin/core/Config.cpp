@@ -313,7 +313,13 @@ void loadConfig(Config& c) {
         f = std::atof(envOr("KENSHICOOP_INTERP_SNAP_DIST", "0").c_str());
         c.interpSnapDist = (f > 0.0) ? (float)f : 50.0f;
         f = std::atof(envOr("KENSHICOOP_CATCHUP_K", "0").c_str());
-        c.catchupK = (f > 0.0) ? (float)f : 2.0f;
+        // Default lowered 2.0 -> 1.4 (midpoint of the 1.3-1.5 band under trial)
+        // to soften the remote-body gap catch-up boost blamed for the "fast
+        // camera"/lag feel in live play. Still env-overridable (a positive
+        // KENSHICOOP_CATCHUP_K wins); this only moves the fallback. NOTE: this is
+        // a starting-point change pending "by feel" validation in a live session,
+        // not a confirmed fix for the lag.
+        c.catchupK = (f > 0.0) ? (float)f : 1.4f;
         f = std::atof(envOr("KENSHICOOP_SNAP_DIST", "0").c_str());
         c.snapDist = (f > 0.0) ? (float)f : 8.0f;
         f = std::atof(envOr("KENSHICOOP_SNAP_SECONDS", "0").c_str());
