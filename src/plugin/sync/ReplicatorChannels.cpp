@@ -1063,6 +1063,54 @@ void Replicator::applyResearch(const SyncContext& ctx) {
     }
 }
 
+void Replicator::publishWeather(const SyncContext& ctx) {
+    NetLink& net = *ctx.net; u32 ownerId = ctx.localId;
+    if (!weatherSync_) return;
+    engine::WeatherPickOut picks[16];
+    unsigned int n = engine::drainWeatherPicks(picks, 16);
+    for (unsigned int i = 0; i < n; ++i) {
+        if (!picks[i].seasonSid[0] || !picks[i].sid[0]) continue;
+        WeatherPacket pkt;
+        memset(&pkt, 0, sizeof(pkt));
+        pkt.type    = (u8)PKT_WEATHER;
+        pkt.ownerId = ownerId;
+        pkt.seq     = weatherSeqOut_++;
+        strncpy(pkt.seasonSid, picks[i].seasonSid, sizeof(pkt.seasonSid) - 1);
+        strncpy(pkt.sid, picks[i].sid, sizeof(pkt.sid) - 1);
+        pkt.durationMinutes = (picks[i].duration > 0) ? (u32)picks[i].duration : 0;
+        pkt.strength = picks[i].strength;
+        net.queueWeather(pkt);
+        char b[160]; _snprintf(b, sizeof(b) - 1,
+            "[weather] SEND season='%s' sid='%s' dur=%u strength=%.2f seq=%u",
+            picks[i].seasonSid, picks[i].sid, pkt.durationMinutes, picks[i].strength, pkt.seq);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+}
+
+void Replicator::applyWeather(const SyncContext& ctx) {
+    Inbound& in = *ctx.in;
+    if (!weatherSync_) return;
+    std::deque<InboundWeather> got;
+    in.drainWeather(got);
+    if (got.empty()) return;
+    for (std::deque<InboundWeather>::iterator it = got.begin(); it != got.end(); ++it) {
+        const WeatherPacket& p = it->pkt;
+        if (!p.seasonSid[0] || !p.sid[0]) continue;
+        if (!sync::gateSeqAccept(weatherSeqSeen_, p.seq)) continue; // stale/dup row
+        weatherSeqSeen_ = p.seq;
+        // Terminate the wire fields before using them as C strings (readPacket is
+        // a raw memcpy; a corrupt row need not be null-terminated within 48 B).
+        char season[sizeof(p.seasonSid)]; char sid[sizeof(p.sid)];
+        strncpy(season, p.seasonSid, sizeof(season) - 1); season[sizeof(season) - 1] = '\0';
+        strncpy(sid, p.sid, sizeof(sid) - 1); sid[sizeof(sid) - 1] = '\0';
+        engine::setWeatherDecision(season, sid, (int)p.durationMinutes, p.strength);
+        char b[160]; _snprintf(b, sizeof(b) - 1,
+            "[weather] RECV season='%s' sid='%s' dur=%u strength=%.2f seq=%u",
+            season, sid, p.durationMinutes, p.strength, p.seq);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+}
+
 void Replicator::publishBuilds(const SyncContext& ctx) {
     NetLink& net = *ctx.net; u32 ownerId = ctx.localId;
     if (!buildSync_) return;
@@ -1303,8 +1351,16 @@ void Replicator::driveSampledChannels(const SyncContext& ctx) {
         { &Replicator::buildSync_,    0,                     &Replicator::publishBuilds,     &Replicator::applyBuilds,     false },
         { &Replicator::buildSync_,    &Replicator::bdoorSync_, &Replicator::publishBuildDoors, &Replicator::applyBuildDoors, false },
         { &Replicator::prodSync_,     0,                     &Replicator::publishProd,       &Replicator::applyProd,       true  },
-        { &Replicator::researchSync_, 0,                     &Replicator::publishResearch,   &Replicator::applyResearch,   true  }
+        { &Replicator::researchSync_, 0,                     &Replicator::publishResearch,   &Replicator::applyResearch,   true  },
+        { &Replicator::weatherSync_,  0,                     &Replicator::publishWeather,    &Replicator::applyWeather,    true  }
     };
+    // Latch the weather detour's role once from the session host bit (it never
+    // flips mid-session) instead of re-deriving it each tick inside publish/apply.
+    // resetSession clears the latch and the detour state (setWeatherRole(0)).
+    if (weatherSync_ && !weatherRoleSet_) {
+        engine::setWeatherRole(ctx.isHost ? 1 : 2);
+        weatherRoleSet_ = true;
+    }
     const int n = (int)(sizeof(kCh) / sizeof(kCh[0]));
     for (int i = 0; i < n; ++i) {
         const Desc& d = kCh[i];

@@ -110,22 +110,15 @@
             Tier = 'smoke'; WanVariant = $true
         }
 
-        # ident_sync (protocol 46 regression for PR #28 fixes #4 name-sync + #5
-        # animal-age-sync): squad1 + the 'npc' setup scene has the host spawn a
-        # world NPC that the join mints as a proxy - name_sync asserts the minted
-        # proxy carries the host's replicated name (not the default "Name"), and
-        # age_sync asserts the StatsPacket age agrees host<->join. name_sync is the
-        # PrimaryGate (the mint is the always-present signal); age_sync SKIPs
-        # cleanly if no aged body is under sync (a squad-animal fixture would make
-        # #5 deterministic). Tier 'none' = run explicitly (-Scenario ident_sync).
+        # ident_sync (regression for name-sync + animal-age-sync): the 'recruit'
+        # setup scene has the host spawn + recruit a world NPC so it becomes an
+        # OWNED member that publishOwned streams and the join MINTS as a proxy - a
+        # deterministic runtime mint. name_sync (PrimaryGate) asserts that minted
+        # proxy carries the host's replicated name, never the default "Name";
+        # age_sync asserts the StatsPacket age agrees host<->join. Tier 'none' =
+        # run explicitly.
         ident_sync = @{
             Save = 'squad1'; Setup = 'recruit'; Tolerance = 3.0
-            # The 'recruit' setup scene has the host spawn + recruit a world NPC, so
-            # it becomes an OWNED member that publishOwned streams and the join MINTS
-            # as a proxy - a deterministic runtime mint. name_sync (PrimaryGate)
-            # asserts that minted proxy carries the host's replicated name, never the
-            # default "Name" (PR #28 fix #4). age_sync asserts the StatsPacket age
-            # agrees host<->join (fix #5). Tier 'none' = run explicitly.
             PrimaryGate = 'name_sync'
             Gating   = @('name_sync', 'age_sync')
             Advisory = @('clock_sync')
@@ -153,6 +146,22 @@
             Save = 'squad1'; Setup = ''; Tolerance = 3.0
             PrimaryGate = 'death_portrait'
             Gating   = @('death_portrait')
+            Advisory = @('clock_sync')
+            Tier = 'none'; WanVariant = $false
+        }
+
+        # weather_sync (protocol 46 weather v2): both clients load squad1 so they
+        # share one weather region/season. weather_hook is the PrimaryGate (proves
+        # the setupWeather detour installed on BOTH clients - always has signal);
+        # weather_sync judges host->join agreement (season+sid+duration per seq) IF
+        # a transition fires in the window. Weather changes on game-hours, so a
+        # short run usually SKIPs the sync gate (no signal, tolerated). Tier 'none'
+        # = runs only when explicitly named (-Scenario weather_sync) until a forcing
+        # setup scene makes an in-window transition deterministic.
+        weather_sync = @{
+            Save = 'squad1'; Setup = ''; Tolerance = 3.0
+            PrimaryGate = 'weather_hook'
+            Gating   = @('weather_hook', 'weather_sync')
             Advisory = @('clock_sync')
             Tier = 'none'; WanVariant = $false
         }

@@ -1715,6 +1715,22 @@ private:
     bool       bled_;
 };
 
+// WeatherSyncScenario (protocol 46 weather v2) - PASSIVE observer. Weather
+// transitions stream on the host's own game-time cadence through the
+// setupWeather detour ("[weather] SEND" on the host, "[weather] RECV" on the
+// join); the weather_hook + weather_sync ORACLES judge those lines. This
+// scenario carries no logic of its own - it only holds the armed run open long
+// enough for transitions to land, then reports PASS as a liveness/completion
+// marker (the real verdict is the oracle's). Identical on host + join.
+// ===========================================================================
+class WeatherSyncScenario : public Scenario {
+public:
+    const char* name() const { return "weather_sync"; }
+    void onStart(const ScenarioContext&) {}
+    bool onTick(const ScenarioContext& ctx) { return ctx.elapsedMs >= 30000; }
+    bool passed() const { return true; }
+};
+
 } // namespace
 
 Scenario* makeProbeScenario(const std::string& name) {
@@ -1735,6 +1751,7 @@ Scenario* makeProbeScenario(const std::string& name) {
     if (name == "hunger_sync")   return new HungerProbeScenario(false);
     if (name == "ident_sync")    return new IdentSyncScenario();
     if (name == "death_portrait") return new DeathPortraitScenario();
+    if (name == "weather_sync")  return new WeatherSyncScenario();
     return 0;
 }
 

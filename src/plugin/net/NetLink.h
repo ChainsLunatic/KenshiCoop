@@ -118,6 +118,9 @@ public:
     // MAIN thread: queue a reliable host-authoritative known-research row
     // (protocol 38). First-sight sent + safety-resent by the caller.
     void queueResearch(const ResearchPacket& pkt);
+    // MAIN thread: queue a reliable host-authoritative active-biome weather row
+    // (protocol 46). Change-gated + safety-resent by the caller.
+    void queueWeather(const WeatherPacket& pkt);
     void queueBuildPlace(const BuildPlacePacket& pkt);
     void queueBuildState(const BuildStatePacket& pkt);
     void queueBuildDoor(const BuildDoorPacket& pkt);
@@ -266,6 +269,8 @@ private:
     std::vector<ProdPacket>      outProd_;
     // Reliable known-research rows (protocol 38). Guarded by outCs_.
     std::vector<ResearchPacket>  outResearch_;
+    // Reliable active-biome weather rows (protocol 46). Guarded by outCs_.
+    std::vector<WeatherPacket>   outWeather_;
     std::vector<BuildPlacePacket> outBuildPlace_;
     std::vector<BuildStatePacket> outBuildState_;
     std::vector<BuildDoorPacket>  outBuildDoor_;

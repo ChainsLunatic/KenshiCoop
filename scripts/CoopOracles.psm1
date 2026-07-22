@@ -206,6 +206,8 @@ function Invoke-OneOracle {
         "anti_zombie"   { return (Test-AntiZombie      -HostFile $HostLog -JoinFile $JoinLog) }
         "lifecycle"     { return (Test-Lifecycle       -JoinFile $JoinLog) }
         "clock_sync"    { return (Test-ClockSync       -HostFile $HostLog -JoinFile $JoinLog -ExpectedSkewMs $ExpectedSkewMs) }
+        "weather_hook"  { return (Test-WeatherHook      -HostFile $HostLog -JoinFile $JoinLog) }
+        "weather_sync"  { return (Test-WeatherSync      -HostFile $HostLog -JoinFile $JoinLog) }
         "panel_config"  { return (Test-PanelConfig     -File $HostLog) }
         default {
             Write-Host "  WARNING: unknown oracle id '$Id' (manifest error)"

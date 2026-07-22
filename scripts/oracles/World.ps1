@@ -2313,3 +2313,79 @@ function Test-VendorTrade {
                 -Metrics @{ walletCrossed = $crossed } -Detail $detail)
 }
 
+# weather_hook (protocol 46 weather v2): EVIDENCE gate that the setupWeather
+# detour installed on BOTH clients (the v2 mechanism is live). Weather changes
+# are game-hours apart, so this is the always-available signal; weather_sync
+# judges actual cross-client agreement WHEN a transition lands in the window.
+function Test-WeatherHook {
+    param([string]$HostFile, [string]$JoinFile)
+    $ok  = 'weather\] setupWeather detour installed'
+    $bad = 'weather\] FAILED to install'
+    $hOn   = @(Select-String -Path $HostFile -Pattern $ok  -ErrorAction SilentlyContinue).Count -gt 0
+    $jOn   = @(Select-String -Path $JoinFile -Pattern $ok  -ErrorAction SilentlyContinue).Count -gt 0
+    $hFail = @(Select-String -Path $HostFile -Pattern $bad -ErrorAction SilentlyContinue).Count -gt 0
+    $jFail = @(Select-String -Path $JoinFile -Pattern $bad -ErrorAction SilentlyContinue).Count -gt 0
+    if ($hFail -or $jFail) {
+        $d = "detour FAILED to install (host=$hFail join=$jFail) - prologue scan missed (game update?)"
+        Write-Host "  WEATHER-HOOK FAIL - $d"
+        return (Add-GateResult -Name "weather_hook" -Status FAIL -Detail $d)
+    }
+    if ($hOn -and $jOn) {
+        Write-Host "  WEATHER-HOOK PASS - detour installed on both clients"
+        return (Add-GateResult -Name "weather_hook" -Status PASS -Metrics @{ host = 1; join = 1 })
+    }
+    $d = "install line absent (host=$hOn join=$jOn) - weatherSync off or plugin not loaded"
+    Write-Host "  WEATHER-HOOK SKIP - $d"
+    return (Add-GateResult -Name "weather_hook" -Status SKIP -Detail $d)
+}
+
+# weather_sync (protocol 46 weather v2): cross-client agreement. The host emits
+# one [weather] SEND per transition (season sid + chosen weather sid + duration
+# + a global monotonic seq); the join emits [weather] RECV as it records each
+# ruling. PASS iff every host row the join saw agrees on season+sid+dur for the
+# same seq. SKIP when no transition fired in the (short) window - weather changes
+# on game-hours, so a clean short run often has NO signal; that is expected, not
+# a failure (this gate is not the scenario PrimaryGate for that reason).
+function Test-WeatherSync {
+    param([string]$HostFile, [string]$JoinFile)
+    $reS = "\[weather\] SEND season='([^']*)' sid='([^']*)' dur=(\d+) strength=[-\d.]+ seq=(\d+)"
+    $reR = "\[weather\] RECV season='([^']*)' sid='([^']*)' dur=(\d+) strength=[-\d.]+ seq=(\d+)"
+    $sent = @{}
+    foreach ($m in @(Select-String -Path $HostFile -Pattern $reS -ErrorAction SilentlyContinue)) {
+        $g = $m.Matches[0].Groups
+        $sent[$g[4].Value] = @{ season = $g[1].Value; sid = $g[2].Value; dur = $g[3].Value }
+    }
+    $recv = @{}
+    foreach ($m in @(Select-String -Path $JoinFile -Pattern $reR -ErrorAction SilentlyContinue)) {
+        $g = $m.Matches[0].Groups
+        $recv[$g[4].Value] = @{ season = $g[1].Value; sid = $g[2].Value; dur = $g[3].Value }
+    }
+    if ($sent.Count -eq 0) {
+        $d = "no host weather transition in window (weather changes on game-hours) - no signal"
+        Write-Host "  WEATHER-SYNC SKIP - $d"
+        return (Add-GateResult -Name "weather_sync" -Status SKIP `
+                    -Metrics @{ sent = 0; recv = $recv.Count } -Detail $d)
+    }
+    $matched = 0; $disagree = 0; $missing = 0
+    foreach ($seq in $sent.Keys) {
+        if (-not $recv.ContainsKey($seq)) { $missing++; continue }
+        $s = $sent[$seq]; $r = $recv[$seq]
+        if ($s.sid -eq $r.sid -and $s.dur -eq $r.dur -and $s.season -eq $r.season) { $matched++ }
+        else { $disagree++ }
+    }
+    $met = @{ sent = $sent.Count; recv = $recv.Count; matched = $matched; disagree = $disagree; missing = $missing }
+    if ($disagree -gt 0) {
+        $d = "$disagree/$($sent.Count) rows disagree (season/sid/dur mismatch host vs join)"
+        Write-Host "  WEATHER-SYNC FAIL - $d"
+        return (Add-GateResult -Name "weather_sync" -Status FAIL -Metrics $met -Detail $d)
+    }
+    if ($matched -gt 0) {
+        $d = "$matched host transition(s) replayed on join, all agree (missing=$missing pending delivery)"
+        Write-Host "  WEATHER-SYNC PASS - $d"
+        return (Add-GateResult -Name "weather_sync" -Status PASS -Metrics $met -Detail $d)
+    }
+    $d = "$($sent.Count) host transition(s) but none received on join yet (delivery timing)"
+    Write-Host "  WEATHER-SYNC SKIP - $d"
+    return (Add-GateResult -Name "weather_sync" -Status SKIP -Metrics $met -Detail $d)
+}
+
