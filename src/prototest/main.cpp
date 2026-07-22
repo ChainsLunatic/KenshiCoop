@@ -114,6 +114,7 @@ static void testSizes() {
     CHECK_EQ("sizeof(ProdPacket)",              sizeof(ProdPacket),              109);
     CHECK_EQ("sizeof(NpcCensusHeader)",         sizeof(NpcCensusHeader),         7); // v35: census
     CHECK_EQ("sizeof(ResearchPacket)",          sizeof(ResearchPacket),          57); // v37: research
+    CHECK_EQ("sizeof(WeatherPacket)",           sizeof(WeatherPacket),           113); // v46: weather (v2: +seasonSid +duration)
     CHECK_EQ("sizeof(CamHintPacket)",           sizeof(CamHintPacket),           17); // v43: camera hint
     // A full entity batch must fit one ~1400 B datagram (NetLink chunking cap).
     CHECK("entity batch fits datagram",
@@ -220,7 +221,7 @@ static void testSizes() {
     CHECK_EQ("EVT_SQUAD_MOVE id", (int)EVT_SQUAD_MOVE, 11);
     CHECK("EVT_SQUAD_MOVE distinct", EVT_SQUAD_MOVE != EVT_RECRUIT &&
           EVT_SQUAD_MOVE != EVT_NONE && EVT_SQUAD_MOVE != EVT_EXIT_FURNITURE);
-    CHECK_EQ("PROTOCOL_VERSION (v46: character name + animal age sync)", (int)PROTOCOL_VERSION, 46);
+    CHECK_EQ("PROTOCOL_VERSION (v46: character name + animal age + weather sync)", (int)PROTOCOL_VERSION, 46);
 }
 
 // ---- 2. readPacket / packetType round-trips -----------------------------------
@@ -289,6 +290,7 @@ static void testRoundTrips() {
     roundTrip<LoadNackPacket>("LoadNackPacket", (u8)PKT_LOAD_NACK);
     roundTrip<ProdPacket>("ProdPacket", (u8)PKT_PROD);
     roundTrip<ResearchPacket>("ResearchPacket", (u8)PKT_RESEARCH);
+    roundTrip<WeatherPacket>("WeatherPacket", (u8)PKT_WEATHER);
 
     CHECK("packetType(null) == 0", packetType(0, 10) == 0);
     unsigned char b0[1] = { 0 };

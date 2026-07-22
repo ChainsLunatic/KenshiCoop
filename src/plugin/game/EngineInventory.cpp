@@ -1584,51 +1584,17 @@ int reequipLooseItem(GameWorld* gw, const unsigned int cHand[5],
 // (version remap), and a mid-instruction jump can land on __fastfail, which
 // no SEH frame catches. The two bases are logged once for the evidence trail.
 
-namespace {
-
-const unsigned int R401_WIN = 0x800; // Research-object snapshot window (bytes)
-unsigned char g_r401Snap[0x800];
-bool  g_r401Have = false;
-void* g_r401Ptr  = 0;
-
-typedef bool (__fastcall* R401BoolGdFn)(void* research, GameData* gd);
-typedef bool (__fastcall* R401CanFn)(void* research, GameData* gd,
-                                     bool a, bool b);
-typedef void (__fastcall* R401StartFn)(void* research, GameData* gd);
-
-// SEH-guarded prologue compare - a raw-RVA call is only allowed when the live
-// bytes are EXACTLY the disassembled function's prologue. A wrong base (or a
-// different exe build) fails the compare instead of jumping into garbage,
-// where a mid-instruction landing can hit __fastfail - unrecoverable by SEH
-// (run 211124 killed both clients that way).
-bool r401SigOk(unsigned __int64 addr, const unsigned char* sig,
-               unsigned int n) {
-    __try {
-        return memcmp((const void*)addr, sig, n) == 0;
-    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
-}
-
-struct R401Levers {
-    R401BoolGdFn isKnown;
-    R401CanFn    can;
-    R401StartFn  start;
-};
-
-unsigned __int64 r401Base() {
-    static unsigned __int64 base = 0;
-    if (!base) base = (unsigned __int64)GetModuleHandleA(NULL);
-    return base;
-}
-
 // Scan the running module's .text for a unique byte signature. The on-disk exe
 // RVAs do NOT map to the live image by base+RVA (run 212346: klib's getTechLevel
 // resolved to base+0x2ADE00, 0x470 past the on-disk 0x2AD990, and the on-disk
 // bytes there are unrelated - the executing image differs from the file on
 // disk). A prologue scan finds each function at its TRUE runtime address no
-// matter the skew (each signature was verified count==1 in the file's .text).
-// SEH-guarded page walk; returns 0 if not found.
-unsigned __int64 r401ScanText(const unsigned char* sig, unsigned int n) {
-    unsigned __int64 base = r401Base();
+// matter the skew (each signature verified count==1 in the file's .text).
+// SEH-guarded page walk; returns 0 if not found. Shared by the research levers
+// and the weather detour (Engine.h).
+unsigned __int64 scanTextSig(const unsigned char* sig, unsigned int n) {
+    static unsigned __int64 base = 0;
+    if (!base) base = (unsigned __int64)GetModuleHandleA(NULL);
     if (!base || !sig || n == 0) return 0;
     __try {
         const unsigned char* p = (const unsigned char*)base;
@@ -1659,6 +1625,40 @@ unsigned __int64 r401ScanText(const unsigned char* sig, unsigned int n) {
     return 0;
 }
 
+namespace {
+
+const unsigned int R401_WIN = 0x800; // Research-object snapshot window (bytes)
+unsigned char g_r401Snap[0x800];
+bool  g_r401Have = false;
+void* g_r401Ptr  = 0;
+
+typedef bool (__fastcall* R401BoolGdFn)(void* research, GameData* gd);
+typedef bool (__fastcall* R401CanFn)(void* research, GameData* gd,
+                                     bool a, bool b);
+typedef void (__fastcall* R401StartFn)(void* research, GameData* gd);
+
+// SEH-guarded prologue compare - a raw-RVA call is only allowed when the live
+// bytes are EXACTLY the disassembled function's prologue. A wrong base (or a
+// different exe build) fails the compare instead of jumping into garbage,
+// where a mid-instruction landing can hit __fastfail - unrecoverable by SEH
+// (run 211124 killed both clients that way).
+bool r401SigOk(unsigned __int64 addr, const unsigned char* sig,
+               unsigned int n) {
+    __try {
+        return memcmp((const void*)addr, sig, n) == 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+struct R401Levers {
+    R401BoolGdFn isKnown;
+    R401CanFn    can;
+    R401StartFn  start;
+};
+
+// The .text prologue scanner is coop::engine::scanTextSig (defined just above,
+// outside this anonymous namespace so the weather detour can share it). See its
+// comment for why base+RVA is unreliable and a signature scan is used instead.
+
 // Locate the three lever entry points once by prologue scan. All-or-nothing:
 // any miss disables every raw call this spike makes.
 const R401Levers* r401GetLevers() {
@@ -1676,9 +1676,9 @@ const R401Levers* r401GetLevers() {
         static const unsigned char sigStart[] = {
             0x48,0x8B,0xC4,0x55,0x57,0x41,0x54,0x41,0x55,0x41,0x56,0x48,
             0x8D,0xA8,0x38,0xFE,0xFF,0xFF,0x48,0x81,0xEC,0xA0,0x02,0x00 };
-        unsigned __int64 a = r401ScanText(sigKnown, sizeof(sigKnown));
-        unsigned __int64 b = r401ScanText(sigCan, sizeof(sigCan));
-        unsigned __int64 c = r401ScanText(sigStart, sizeof(sigStart));
+        unsigned __int64 a = scanTextSig(sigKnown, sizeof(sigKnown));
+        unsigned __int64 b = scanTextSig(sigCan, sizeof(sigCan));
+        unsigned __int64 c = scanTextSig(sigStart, sizeof(sigStart));
         char msg[200];
         _snprintf(msg, sizeof(msg) - 1,
                   "[r401] lever scan isKnown=%016llx can=%016llx start=%016llx",

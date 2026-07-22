@@ -2004,6 +2004,7 @@ void installEngineDetours() {
     g_repl.setHungerSync(g_cfg.hungerSync);
     g_repl.setProdSync(g_cfg.prodSync);
     g_repl.setResearchSync(g_cfg.researchSync);
+    g_repl.setWeatherSync(g_cfg.weatherSync);
     // Protocol 34: the HOST authors every storage/machine container near the
     // interest centers (the ~1 Hz census inside publishInventories); the join
     // reconciles via the translated key. Host-only flag - the join must never
@@ -2081,6 +2082,16 @@ void installEngineDetours() {
                 : "[load] load detour installed; load-edge logging ON");
         else
             coopLog("[load] FAILED to install load detour; coordinated load degraded");
+    }
+
+    // Weather sync (protocol 46): detour WeatherInstance::setupWeather so every
+    // weather transition is captured (host) or replayed from the host's ruling
+    // (join). Located by prologue scan (the PDB weather RVAs don't map here).
+    if (g_cfg.weatherSync) {
+        if (coop::engine::installWeatherHook())
+            coopLog("[weather] setupWeather detour installed; weather sync ON");
+        else
+            coopLog("[weather] FAILED to install setupWeather detour; weather sync OFF");
     }
 }
 

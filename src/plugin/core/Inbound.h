@@ -213,6 +213,13 @@ struct InboundResearch {
     ResearchPacket pkt;
 };
 
+// One received active-biome weather row (protocol 46): the HOST reports its
+// active weather sid + strength; the join applies it to its own region.
+struct InboundWeather {
+    u32           ownerId;
+    WeatherPacket pkt;
+};
+
 // One received stealth detection-map snapshot (protocol 20): the detection
 // AUTHORITY (the host's world, where the sneaker is a driven copy) streams who
 // notices the sneaker; the sneaker's OWNER replays the entries between its
@@ -376,7 +383,7 @@ public:
         speed_(worldReset_),
         stats_(worldReset_),      money_(worldReset_),      faction_(worldReset_),
         time_(worldReset_),       door_(worldReset_),       prod_(worldReset_),
-        research_(worldReset_),   buildPlace_(worldReset_), buildState_(worldReset_),
+        research_(worldReset_),   weather_(worldReset_),    buildPlace_(worldReset_), buildState_(worldReset_),
         buildDoor_(worldReset_),  buildRemove_(worldReset_), stealth_(worldReset_, 512),
         spawnReq_(worldReset_),   spawnInfo_(worldReset_),  camHint_(worldReset_, 64) {
         InitializeCriticalSection(&cs_);
@@ -521,6 +528,11 @@ public:
     void pushResearch(u32 ownerId, const ResearchPacket& pkt) {
         InboundResearch ir; ir.ownerId = ownerId; ir.pkt = pkt;
         EnterCriticalSection(&cs_); research_.push_back(ir); LeaveCriticalSection(&cs_);
+    }
+    // NET thread: one received active-biome weather row (protocol 46), owner-tagged.
+    void pushWeather(u32 ownerId, const WeatherPacket& pkt) {
+        InboundWeather iw; iw.ownerId = ownerId; iw.pkt = pkt;
+        EnterCriticalSection(&cs_); weather_.push_back(iw); LeaveCriticalSection(&cs_);
     }
     // NET thread: one received placed-building announcement (protocol 27), owner-tagged.
     void pushBuildPlace(u32 ownerId, const BuildPlacePacket& pkt) {
@@ -669,6 +681,9 @@ public:
     void drainResearch(std::deque<InboundResearch>& out) {
         EnterCriticalSection(&cs_); out.swap(research_); LeaveCriticalSection(&cs_);
     }
+    void drainWeather(std::deque<InboundWeather>& out) {
+        EnterCriticalSection(&cs_); out.swap(weather_); LeaveCriticalSection(&cs_);
+    }
     void drainBuildPlace(std::deque<InboundBuildPlace>& out) {
         EnterCriticalSection(&cs_); out.swap(buildPlace_); LeaveCriticalSection(&cs_);
     }
@@ -779,6 +794,7 @@ private:
     WorldQ<InboundDoor>            door_;
     WorldQ<InboundProd>            prod_;
     WorldQ<InboundResearch>        research_;
+    WorldQ<InboundWeather>         weather_;
     WorldQ<InboundBuildPlace>      buildPlace_;
     WorldQ<InboundBuildState>      buildState_;
     WorldQ<InboundBuildDoor>       buildDoor_;

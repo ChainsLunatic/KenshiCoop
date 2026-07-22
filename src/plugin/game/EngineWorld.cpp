@@ -13,6 +13,7 @@
 // (see resources/CODE_MAP.md).
 
 #include "EngineInternal.h"
+#include <kenshi/Weather.h> // WeatherSystem singleton + WeatherInstance/Weather layout (protocol 46 weather sync)
 
 namespace coop {
 namespace engine {
@@ -42,6 +43,158 @@ Character* traderOf(ShopTrader* st) {
     return t;
 }
 } // namespace
+
+// Weather sync (protocol 46, host-authoritative, event-driven). Instead of
+// polling the WeatherSystem singleton, we detour WeatherInstance::setupWeather
+// (self, newWeather) - the exact point the engine commits a new weather to a
+// region and rolls its duration. The HOST lets the engine pick, then captures
+// (season sid, chosen weather sid, duration, strength). The JOIN, when its own
+// setupWeather fires for a season the host has ruled on, swaps newWeather for
+// the host's choice and overwrites the freshly rolled duration + strength.
+// Keyed by SEASON sid (newWeather->season), so a peer standing in a different
+// biome keeps its own weather. setupWeather runs off WeatherSystem::updateBT (a
+// background thread), so the pick queue + decision map are CRITICAL_SECTION
+// guarded. The entry is found by a unique prologue scan - the KenshiLib PDB
+// weather RVAs do NOT map into the running exe (the per-function skew that made
+// r401 switch to scanning; the PDB's setupWeather RVA resolves to unrelated
+// bytes here). Every offset touch is SEH-guarded.
+namespace {
+typedef void (__fastcall* SetupWeatherFn)(WeatherInstance*, Weather*);
+SetupWeatherFn g_setupWeatherOrig = 0;
+int            g_weatherRole = 0; // 0 off, 1 host (capture), 2 join (apply)
+
+CRITICAL_SECTION g_weatherCs;
+bool             g_weatherCsInit = false;
+std::vector<WeatherPickOut>            g_weatherCaptured;   // host: picks to send
+std::map<std::string, WeatherPickOut>  g_weatherDecisions;  // join: host's ruling
+
+const char* weatherSidOf(Weather* w) {
+    if (!w || !w->weatherData) return 0;
+    const char* s = w->weatherData->stringID.c_str();
+    return (s && s[0]) ? s : 0;
+}
+
+// The map/vector touches live in their own (SEH-free) helpers: a function that
+// uses __try may not also own C++ objects that require unwinding (C2712), and a
+// std::map iterator is one. So the detour keeps __try strictly around the raw
+// engine-pointer reads and calls these for the lock-guarded container work.
+bool weatherTakeDecision(const char* seasonSid, WeatherPickOut* out) {
+    if (!g_weatherCsInit) return false;
+    bool got = false;
+    EnterCriticalSection(&g_weatherCs);
+    std::map<std::string, WeatherPickOut>::iterator f = g_weatherDecisions.find(seasonSid);
+    if (f != g_weatherDecisions.end()) { *out = f->second; got = true; }
+    LeaveCriticalSection(&g_weatherCs);
+    return got;
+}
+
+void weatherPushCapture(const WeatherPickOut& p) {
+    if (!g_weatherCsInit) return;
+    EnterCriticalSection(&g_weatherCs);
+    g_weatherCaptured.push_back(p);
+    LeaveCriticalSection(&g_weatherCs);
+}
+
+void __fastcall setupWeather_hook(WeatherInstance* self, Weather* newWeather) {
+    char seasonSid[48]; seasonSid[0] = '\0';
+    Weather* chosen = newWeather;
+    Season* season = 0; // raw pointer, no unwinding - safe to hoist across __try
+    WeatherPickOut rule; bool haveRule = false;
+    __try {
+        season = newWeather ? newWeather->season : 0;
+        if (season && season->seasonData) {
+            const char* ss = season->seasonData->stringID.c_str();
+            if (ss) { strncpy(seasonSid, ss, sizeof(seasonSid) - 1); seasonSid[sizeof(seasonSid) - 1] = '\0'; }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+
+    if (g_weatherRole == 2 && seasonSid[0])
+        haveRule = weatherTakeDecision(seasonSid, &rule);
+
+    __try {
+        if (haveRule && season && rule.sid[0]) {
+            unsigned int n = season->weathers.size();
+            for (unsigned int i = 0; i < n; ++i) {
+                const char* c = weatherSidOf(season->weathers[i]);
+                if (c && strcmp(c, rule.sid) == 0) { chosen = season->weathers[i]; break; }
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+
+    g_setupWeatherOrig(self, chosen);
+
+    WeatherPickOut cap; bool doCapture = false;
+    __try {
+        if (g_weatherRole == 2 && haveRule) {
+            // duration <= 0 => leave the engine's freshly rolled window (a zero
+            // window would expire instantly and re-fire setupWeather in a loop).
+            if (rule.duration > 0) self->endTimeMinutes = self->startTimeMinutes + rule.duration;
+            if (rule.strength >= 0.0f) self->strength = rule.strength;
+        } else if (g_weatherRole == 1 && seasonSid[0]) {
+            const char* ws = weatherSidOf(self->weather);
+            if (ws) {
+                strncpy(cap.seasonSid, seasonSid, sizeof(cap.seasonSid) - 1); cap.seasonSid[sizeof(cap.seasonSid) - 1] = '\0';
+                strncpy(cap.sid, ws, sizeof(cap.sid) - 1); cap.sid[sizeof(cap.sid) - 1] = '\0';
+                cap.duration = self->endTimeMinutes - self->startTimeMinutes;
+                cap.strength = self->strength;
+                doCapture = true;
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+
+    if (doCapture) weatherPushCapture(cap);
+}
+} // namespace
+
+bool installWeatherHook() {
+    // 32-byte prologue of WeatherInstance::setupWeather in the 1.0.65 .text
+    // (unique at 27 B, 32 for margin; verified count==1). mov r11,rsp; push rdi;
+    // sub rsp,0x90; mov [rsp+0x28],-2; mov [r11+0x10],rbx; ...
+    static const unsigned char sig[] = {
+        0x4C,0x8B,0xDC,0x57,0x48,0x81,0xEC,0x90,0x00,0x00,0x00,0x48,0xC7,0x44,0x24,0x28,
+        0xFE,0xFF,0xFF,0xFF,0x49,0x89,0x5B,0x10,0x49,0x89,0x6B,0x18,0x49,0x89,0x73,0x20 };
+    unsigned __int64 addr = scanTextSig(sig, sizeof(sig));
+    if (!addr) return false;
+    if (!g_weatherCsInit) { InitializeCriticalSection(&g_weatherCs); g_weatherCsInit = true; }
+    return KenshiLib::AddHook((intptr_t)addr, (void*)&setupWeather_hook,
+                              (void**)&g_setupWeatherOrig) == KenshiLib::SUCCESS;
+}
+
+void setWeatherRole(int role) {
+    g_weatherRole = role;
+    if (role == 0 && g_weatherCsInit) {
+        EnterCriticalSection(&g_weatherCs);
+        g_weatherCaptured.clear();
+        g_weatherDecisions.clear();
+        LeaveCriticalSection(&g_weatherCs);
+    }
+}
+
+unsigned int drainWeatherPicks(WeatherPickOut* out, unsigned int maxOut) {
+    if (!out || !maxOut || !g_weatherCsInit) return 0;
+    unsigned int n = 0;
+    EnterCriticalSection(&g_weatherCs);
+    for (size_t i = 0; i < g_weatherCaptured.size() && n < maxOut; ++i, ++n)
+        out[n] = g_weatherCaptured[i];
+    g_weatherCaptured.clear();
+    LeaveCriticalSection(&g_weatherCs);
+    return n;
+}
+
+// The stale-row guard lives on the Replicator (applyWeather gates via
+// sync::gateSeqAccept, like every other apply path), so only accepted rulings
+// reach here and the latest simply overwrites its season's entry.
+void setWeatherDecision(const char* seasonSid, const char* sid, int duration,
+                        float strength) {
+    if (!seasonSid || !seasonSid[0] || !sid || !g_weatherCsInit) return;
+    WeatherPickOut p;
+    strncpy(p.seasonSid, seasonSid, sizeof(p.seasonSid) - 1); p.seasonSid[sizeof(p.seasonSid) - 1] = '\0';
+    strncpy(p.sid, sid, sizeof(p.sid) - 1); p.sid[sizeof(p.sid) - 1] = '\0';
+    p.duration = duration; p.strength = strength;
+    EnterCriticalSection(&g_weatherCs);
+    g_weatherDecisions[seasonSid] = p;
+    LeaveCriticalSection(&g_weatherCs);
+}
 
 unsigned int listVendorsNear(GameWorld* gw, VendorRead* out, unsigned int maxOut,
                              float radius) {

@@ -69,7 +69,8 @@ enum PacketType {
     PKT_INV_XFER         = 39,// RELIABLE cross-owner transfer intent (protocol 37); InvXferPacket
     PKT_RESEARCH         = 40,// RELIABLE host-authoritative known-research row (protocol 38); ResearchPacket
     PKT_CAM_HINT         = 41,// UNRELIABLE join camera center hint (protocol 43, join -> host); CamHintPacket
-    PKT_COMBAT_HIT       = 42 // RELIABLE join-dealt authoritative damage report (join -> host, protocol 45); CombatHitPacket
+    PKT_COMBAT_HIT       = 42,// RELIABLE join-dealt authoritative damage report (join -> host, protocol 45); CombatHitPacket
+    PKT_WEATHER          = 43 // RELIABLE host-authoritative active-biome weather row (protocol 46); WeatherPacket
 };
 
 // One-shot transition events carried on the RELIABLE channel. Continuous state
@@ -1197,6 +1198,25 @@ struct ResearchPacket {
     u32 ownerId;   // network player id of the sender (the host)
     u32 seq;       // per-sender monotonic (stale-row guard)
     char sid[48];  // RESEARCH GameData stringID (the wire key)
+};
+
+// Active-biome weather (protocol 46, host-authoritative, event-driven). The host
+// captures each weather transition its engine commits (WeatherInstance::setupWeather)
+// and streams the SEASON sid (biome key), chosen weather sid, rolled duration and
+// strength; the join replays it at its own next transition for the matching season
+// (no-op if the season isn't its current one, e.g. the two players are in different
+// biomes). seq is a single global per-sender monotonic counter across all seasons;
+// the join gates on one seqSeen. Ordered-reliable delivery (CH_RELIABLE) means a
+// newer row for any season always arrives with a higher seq, so the global gate
+// never drops a valid row - the per-season safety is emergent, not per-season seq.
+struct WeatherPacket {
+    u8  type;            // = PKT_WEATHER
+    u32 ownerId;         // network player id of the sender (the host)
+    u32 seq;             // global per-sender monotonic (stale-row guard)
+    char seasonSid[48];  // SEASON GameData stringID (the biome key)
+    char sid[48];        // chosen WEATHER GameData stringID
+    u32 durationMinutes; // host's rolled duration (endTimeMinutes - startTimeMinutes)
+    f32 strength;        // WeatherInstance.strength
 };
 
 // NPC existence census (protocol 36): the host's 1 Hz wide-radius hand list.

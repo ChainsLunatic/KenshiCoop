@@ -230,6 +230,7 @@ void loadConfig(Config& c) {
     c.loadSync    = envOr("KENSHICOOP_LOAD_SYNC", "1") != "0";
     c.prodSync    = envOr("KENSHICOOP_PROD_SYNC", "1") != "0";
     c.researchSync = envOr("KENSHICOOP_RESEARCH_SYNC", "1") != "0";
+    c.weatherSync = envOr("KENSHICOOP_WEATHER_SYNC", "1") != "0";
     c.storeSync   = envOr("KENSHICOOP_STORE_SYNC", "1") != "0";
     c.squadSync   = envOr("KENSHICOOP_SQUAD_SYNC", "1") != "0";
     c.latejoinSync = envOr("KENSHICOOP_LATEJOIN_SYNC", "1") != "0";

@@ -466,6 +466,17 @@ public:
     // Research tech-tree sync master enable (KENSHICOOP_RESEARCH_SYNC).
     void setResearchSync(bool v) { researchSync_ = v; }
 
+    // HOST (protocol 46): drain the weather picks the setupWeather detour captured
+    // (one per transition, season-keyed) and stream them; also latches the engine
+    // detour into host (capture) role.
+    void publishWeather(const SyncContext& ctx);
+    // JOIN (protocol 46): record the received rulings into the engine decision map
+    // (the detour replays them at each season's next transition) + latches the
+    // detour into join (apply) role.
+    void applyWeather(const SyncContext& ctx);
+    // Weather sync master enable (KENSHICOOP_WEATHER_SYNC).
+    void setWeatherSync(bool v) { weatherSync_ = v; }
+
     // Phase 6c: drive the change-gated SAMPLED channels (faction, doors, placed
     // buildings, placed-building doors, production, research) from one
     // channel-descriptor registry. Replaces the per-channel if-blocks the tick
@@ -1437,6 +1448,12 @@ private:
     u32           researchSeqOut_;
     unsigned long researchSampleMs_;
     bool          researchSync_;
+    // Weather sync (protocol 46, event-driven). Host stamps outgoing rows; the
+    // capture queue + join decision map live in the engine detour, not here.
+    bool          weatherSync_;
+    u32           weatherSeqOut_;   // host outgoing per-sender seq
+    u32           weatherSeqSeen_;  // join last-accepted seq (stale-row guard)
+    bool          weatherRoleSet_;  // engine detour role latched from ctx.isHost
     // Protocol 23 recruitment sync state.
     bool recruitSync_;
     // Ownership PINS (protocols 23 + 35): per-hand overrides layered on the

@@ -208,6 +208,7 @@ void NetLink::queueDoor(const DoorPacket& pkt) { pushLocked(outCs_, outDoor_, pk
 void NetLink::queueProd(const ProdPacket& pkt) { pushLocked(outCs_, outProd_, pkt); }
 
 void NetLink::queueResearch(const ResearchPacket& pkt) { pushLocked(outCs_, outResearch_, pkt); }
+void NetLink::queueWeather(const WeatherPacket& pkt) { pushLocked(outCs_, outWeather_, pkt); }
 
 void NetLink::queueBuildPlace(const BuildPlacePacket& pkt) { pushLocked(outCs_, outBuildPlace_, pkt); }
 
@@ -715,6 +716,14 @@ void NetLink::threadLoop() {
                         if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &rp)
                             && inbound_) {
                             inbound_->pushResearch(rp.ownerId, rp);
+                        }
+                    } else if (type == PKT_WEATHER) {
+                        // Reliable host-authoritative active-biome weather row
+                        // (protocol 46), applied to the join's own region.
+                        WeatherPacket wp;
+                        if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &wp)
+                            && inbound_) {
+                            inbound_->pushWeather(wp.ownerId, wp);
                         }
                     } else if (type == PKT_BUILD_PLACE) {
                         // Reliable placed-building announcement (protocol 27):
@@ -1329,6 +1338,24 @@ void NetLink::threadLoop() {
         LeaveCriticalSection(&outCs_);
         for (size_t i = 0; i < researchPkts.size(); ++i) {
             ENetPacket* out = enet_packet_create(&researchPkts[i], sizeof(ResearchPacket),
+                                                 ENET_PACKET_FLAG_RELIABLE);
+            if (isHost_) {
+                enet_host_broadcast(enetHost_, CH_RELIABLE, out);
+            } else if (serverPeer_ && serverPeer_->state == ENET_PEER_STATE_CONNECTED) {
+                enet_peer_send(serverPeer_, CH_RELIABLE, out);
+            } else {
+                enet_packet_destroy(out);
+            }
+        }
+
+        // Drain + send queued active-biome weather rows on CH_RELIABLE (protocol
+        // 46). Host-authoritative + change-gated/safety-resent by the caller.
+        std::vector<WeatherPacket> weatherPkts;
+        EnterCriticalSection(&outCs_);
+        weatherPkts.swap(outWeather_);
+        LeaveCriticalSection(&outCs_);
+        for (size_t i = 0; i < weatherPkts.size(); ++i) {
+            ENetPacket* out = enet_packet_create(&weatherPkts[i], sizeof(WeatherPacket),
                                                  ENET_PACKET_FLAG_RELIABLE);
             if (isHost_) {
                 enet_host_broadcast(enetHost_, CH_RELIABLE, out);

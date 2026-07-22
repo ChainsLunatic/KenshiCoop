@@ -336,6 +336,35 @@ Character* spawnProxyNpc(GameWorld* gw, const char* charSid, const char* facSid,
 float charAge(Character* c);
 void  setCharAge(Character* c, float age);
 
+// Scan the running module's .text for a unique byte signature and return the
+// live address of the match (0 if not found). Skew-proof way to locate a
+// function whose on-disk/PDB RVA does not map to the loaded image. SEH-guarded.
+unsigned __int64 scanTextSig(const unsigned char* sig, unsigned int n);
+
+// Weather sync (protocol 46, host-authoritative, event-driven). A detour on
+// WeatherInstance::setupWeather (the point the engine commits a new weather to a
+// region and rolls its duration) captures the host's pick and lets the join swap
+// in the host's, keyed by SEASON sid so a peer in another biome keeps its own.
+// The setup runs off a background weather thread, so the queue/map the accessors
+// touch are lock-guarded. One row drained/applied per weather transition.
+struct WeatherPickOut {
+    char seasonSid[48]; // SEASON GameData stringID (biome key)
+    char sid[48];       // chosen WEATHER GameData stringID
+    int  duration;      // rolled endTimeMinutes - startTimeMinutes
+    float strength;     // WeatherInstance.strength
+};
+// Locate WeatherInstance::setupWeather by prologue scan and detour it. One-shot.
+bool installWeatherHook();
+// Role the detour plays: 0 off, 1 host (capture picks), 2 join (apply host's).
+// Role 0 also clears the pending queue + decision map (session reset).
+void setWeatherRole(int role);
+// HOST: drain the picks captured since the last call (returns count written).
+unsigned int drainWeatherPicks(WeatherPickOut* out, unsigned int maxOut);
+// JOIN: record the host's ruling for a season (caller has already gated stale
+// rows); the detour applies it the next time this season's weather transitions.
+void setWeatherDecision(const char* seasonSid, const char* sid, int duration,
+                        float strength);
+
 // SEH-guarded (Phase 1 spawn parity, game/ZoneQuery.cpp): is the world block at
 // (x,y,z) fully LOADED locally (loaded and not mid-load)? Within a loaded block
 // every baked shared-save NPC resolves by hand, so an unresolvable census hand
