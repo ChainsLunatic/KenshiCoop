@@ -336,6 +336,14 @@ Character* spawnProxyNpc(GameWorld* gw, const char* charSid, const char* facSid,
 float charAge(Character* c);
 void  setCharAge(Character* c, float age);
 
+// Weather sync (protocol 46, host-authoritative): read/apply the active biome's
+// live weather via the WeatherSystem singleton. Both SEH-guarded + validated by
+// the WeatherInstance->regionWeather sentinel. readActiveWeather returns false
+// (empty sid) on fault; applyActiveWeather returns false if the sid isn't a
+// valid weather for the receiver's current region/season.
+bool readActiveWeather(char* sidOut, unsigned int cap, float* strengthOut);
+bool applyActiveWeather(GameWorld* gw, const char* sid, float strength);
+
 // SEH-guarded (Phase 1 spawn parity, game/ZoneQuery.cpp): is the world block at
 // (x,y,z) fully LOADED locally (loaded and not mid-load)? Within a loaded block
 // every baked shared-save NPC resolves by hand, so an unresolvable census hand

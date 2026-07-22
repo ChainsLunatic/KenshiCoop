@@ -69,7 +69,8 @@ enum PacketType {
     PKT_INV_XFER         = 39,// RELIABLE cross-owner transfer intent (protocol 37); InvXferPacket
     PKT_RESEARCH         = 40,// RELIABLE host-authoritative known-research row (protocol 38); ResearchPacket
     PKT_CAM_HINT         = 41,// UNRELIABLE join camera center hint (protocol 43, join -> host); CamHintPacket
-    PKT_COMBAT_HIT       = 42 // RELIABLE join-dealt authoritative damage report (join -> host, protocol 45); CombatHitPacket
+    PKT_COMBAT_HIT       = 42,// RELIABLE join-dealt authoritative damage report (join -> host, protocol 45); CombatHitPacket
+    PKT_WEATHER          = 43 // RELIABLE host-authoritative active-biome weather row (protocol 46); WeatherPacket
 };
 
 // One-shot transition events carried on the RELIABLE channel. Continuous state
@@ -1197,6 +1198,18 @@ struct ResearchPacket {
     u32 ownerId;   // network player id of the sender (the host)
     u32 seq;       // per-sender monotonic (stale-row guard)
     char sid[48];  // RESEARCH GameData stringID (the wire key)
+};
+
+// Active-biome weather (protocol 46, host-authoritative). The host streams the
+// weather GameData sid + strength of its ActiveRegionWeather; the join applies
+// it to the matching Weather in its own active region/season (no-op if the sid
+// isn't valid there, e.g. the two players are in different biomes).
+struct WeatherPacket {
+    u8  type;      // = PKT_WEATHER
+    u32 ownerId;   // network player id of the sender (the host)
+    u32 seq;       // per-sender monotonic (stale-row guard)
+    char sid[48];  // WEATHER GameData stringID (the wire key)
+    f32 strength;  // WeatherInstance.strength
 };
 
 // NPC existence census (protocol 36): the host's 1 Hz wide-radius hand list.

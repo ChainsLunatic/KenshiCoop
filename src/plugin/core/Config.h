@@ -422,6 +422,12 @@ struct Config {
     // escape hatch.
     bool          researchSync;
 
+    // KENSHICOOP_WEATHER_SYNC (default ON): host-authoritative active-biome
+    // weather sync (protocol 46). The host streams its active weather only when
+    // the peer camera is co-located (same biome; weather is uniform per biome),
+    // and the join applies it to its own active region. "0" is the A/B escape hatch.
+    bool          weatherSync;
+
     // KENSHICOOP_STORE_SYNC (default ON): storage/machine container sync
     // (protocol 34) - the HOST censuses container-bearing buildings (storage
     // chests + the machine classes) in the interest spheres ~1 Hz and

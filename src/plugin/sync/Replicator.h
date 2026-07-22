@@ -466,6 +466,16 @@ public:
     // Research tech-tree sync master enable (KENSHICOOP_RESEARCH_SYNC).
     void setResearchSync(bool v) { researchSync_ = v; }
 
+    // HOST (protocol 46): stream the active biome's weather (sid+strength) - but
+    // ONLY when the peer's camera is co-located with ours, so we never paint the
+    // host's biome weather onto a join standing in a different biome (weather is
+    // uniform per biome, so co-location == same weather region).
+    void publishWeather(const SyncContext& ctx);
+    // JOIN (protocol 46): apply the received weather to the local active region.
+    void applyWeather(const SyncContext& ctx);
+    // Weather sync master enable (KENSHICOOP_WEATHER_SYNC).
+    void setWeatherSync(bool v) { weatherSync_ = v; }
+
     // Phase 6c: drive the change-gated SAMPLED channels (faction, doors, placed
     // buildings, placed-building doors, production, research) from one
     // channel-descriptor registry. Replaces the per-channel if-blocks the tick
@@ -1437,6 +1447,14 @@ private:
     u32           researchSeqOut_;
     unsigned long researchSampleMs_;
     bool          researchSync_;
+    // Weather sync (protocol 46). Host: change-gated single active-biome row.
+    bool          weatherSync_;
+    u32           weatherSeqOut_;   // host outgoing per-sender seq
+    u32           weatherSeqSeen_;  // join last-accepted seq (stale-row guard)
+    unsigned long weatherSampleMs_; // host sample gate
+    unsigned long weatherSendMs_;   // host last-send (change/resend gate)
+    char          weatherSid_[48];  // host last-sent weather sid (change detect)
+    float         weatherStrength_; // host last-sent strength (change detect)
     // Protocol 23 recruitment sync state.
     bool recruitSync_;
     // Ownership PINS (protocols 23 + 35): per-hand overrides layered on the

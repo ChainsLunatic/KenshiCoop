@@ -65,11 +65,14 @@ Replicator::Replicator()
       hungerSync_(true),
       prodSeqOut_(1), prodSampleMs_(0), prodSync_(true),
       researchSeqOut_(1), researchSampleMs_(0), researchSync_(true),
+      weatherSync_(true), weatherSeqOut_(1), weatherSeqSeen_(0),
+      weatherSampleMs_(0), weatherSendMs_(0), weatherStrength_(-1.0f),
       storeSync_(false), contCensusMs_(0),
       timeSync_(true), timeSlew_(1.0f), timeSeqOut_(1), timeSeqSeen_(0),
       timeLastSendMs_(0), timeLastLogMs_(0), timeSlewApplied_(-1.0f),
       lifeSweepMs_(0) {
     peerCam_[0] = peerCam_[1] = peerCam_[2] = 0.0f;
+    weatherSid_[0] = '\0';
 }
 
 // ---- Phase 3: unified entity lifecycle ---------------------------------------
@@ -162,6 +165,7 @@ void Replicator::resetSession() {
     jailObs_.clear();          // jail-observe spike per-captive last sample
     proxyByKey_.clear();
     mintedProxies_.clear();
+    weatherSid_[0] = '\0'; weatherSeqSeen_ = 0; weatherStrength_ = -1.0f;
     suppressed_.clear();
     midBand_.clear();          // host mid-band round-robin (rebuilt by next census)
     midCursor_ = 0; midSliceMs_ = 0;

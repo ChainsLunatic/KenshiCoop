@@ -13,6 +13,7 @@
 // (see resources/CODE_MAP.md).
 
 #include "EngineInternal.h"
+#include <kenshi/Weather.h> // WeatherSystem singleton + WeatherInstance/Weather layout (protocol 46 weather sync)
 
 namespace coop {
 namespace engine {
@@ -42,6 +43,68 @@ Character* traderOf(ShopTrader* st) {
     return t;
 }
 } // namespace
+
+// Weather sync (protocol 46, host-authoritative). Read/write the active biome's
+// live weather through the WeatherSystem singleton (getInstance()) and the
+// WeatherInstance/Weather struct layout (KenshiLib PDB offsets). All offset
+// touches are SEH-guarded and validated by the regionWeather back-pointer
+// sentinel, mirroring the bounty spike's discipline. No engine method is called
+// on the apply path (setupWeather/weatherChanged are the __fastfail-prone
+// scanned-RVA levers) - we swap the weather pointer + strength and flag the
+// region so the engine's own update refreshes fog/effects.
+bool readActiveWeather(char* sidOut, unsigned int cap, float* strengthOut) {
+    if (sidOut && cap) sidOut[0] = '\0';
+    if (strengthOut) *strengthOut = -1.0f;
+    if (!sidOut || cap < 2) return false;
+    __try {
+        WeatherSystem* ws = WeatherSystem::getInstance();
+        if (!ws) return false;
+        WeatherRegion* wr = ws->ActiveRegionWeather;
+        if (!wr) return false;
+        WeatherInstance* wi = wr->weatherInstance;
+        if (!wi || wi->regionWeather != wr) return false; // sentinel
+        Weather* w = wi->weather;
+        if (!w || !w->weatherData) return false;
+        const char* sid = w->weatherData->stringID.c_str();
+        if (!sid || !sid[0]) return false;
+        strncpy(sidOut, sid, cap - 1);
+        sidOut[cap - 1] = '\0';
+        if (strengthOut) *strengthOut = wi->strength;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+bool applyActiveWeather(GameWorld* gw, const char* sid, float strength) {
+    if (!gw || !sid || !sid[0]) return false;
+    __try {
+        WeatherSystem* ws = WeatherSystem::getInstance();
+        if (!ws) return false;
+        WeatherRegion* wr = ws->ActiveRegionWeather;
+        if (!wr) return false;
+        WeatherInstance* wi = wr->weatherInstance;
+        if (!wi || wi->regionWeather != wr) return false; // sentinel
+        Season* cs = wr->currentSeason;
+        if (!cs) return false;
+        Weather* target = 0;
+        unsigned int n = cs->weathers.size();
+        for (unsigned int i = 0; i < n; ++i) {
+            Weather* w = cs->weathers[i];
+            if (!w || !w->weatherData) continue;
+            const char* s = w->weatherData->stringID.c_str();
+            if (s && strcmp(s, sid) == 0) { target = w; break; }
+        }
+        if (!target) return false; // host's weather sid not valid in this region/season
+        bool changed = (wi->weather != target);
+        wi->weather = target;
+        if (strength >= 0.0f) wi->strength = strength;
+        if (changed) {
+            wr->weatherUpdated = true;
+            wr->instanceUpdated = true;
+            wr->requestUpdateEffects = true;
+        }
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
 
 unsigned int listVendorsNear(GameWorld* gw, VendorRead* out, unsigned int maxOut,
                              float radius) {

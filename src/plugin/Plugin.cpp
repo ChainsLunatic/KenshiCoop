@@ -2004,6 +2004,7 @@ void installEngineDetours() {
     g_repl.setHungerSync(g_cfg.hungerSync);
     g_repl.setProdSync(g_cfg.prodSync);
     g_repl.setResearchSync(g_cfg.researchSync);
+    g_repl.setWeatherSync(g_cfg.weatherSync);
     // Protocol 34: the HOST authors every storage/machine container near the
     // interest centers (the ~1 Hz census inside publishInventories); the join
     // reconciles via the translated key. Host-only flag - the join must never

@@ -1063,6 +1063,67 @@ void Replicator::applyResearch(const SyncContext& ctx) {
     }
 }
 
+void Replicator::publishWeather(const SyncContext& ctx) {
+    GameWorld* gw = ctx.gw; NetLink& net = *ctx.net; u32 ownerId = ctx.localId;
+    if (!weatherSync_) return;
+    const unsigned long SAMPLE_MS = 1000;
+    const unsigned long RESEND_MS = 5000;
+    unsigned long now = nowMs();
+    if (!sync::gateSampleDue(now, weatherSampleMs_, SAMPLE_MS)) return;
+    weatherSampleMs_ = now;
+    // Co-location gate: weather is uniform per biome, so only sync when the peer
+    // camera shares our biome (== cameras close). Apart, each client keeps its own.
+    bool peerFresh = (peerCamMs_ != 0) && (now - peerCamMs_) <= 3000;
+    if (!peerFresh) return;
+    float myCam[3];
+    if (!engine::cameraCenter(gw, myCam)) return;
+    float dx = myCam[0] - peerCam_[0], dy = myCam[1] - peerCam_[1], dz = myCam[2] - peerCam_[2];
+    const float COLO = 2000.0f; // ~census radius; well inside one biome
+    if ((dx * dx + dy * dy + dz * dz) > COLO * COLO) return;
+    char sid[48]; float strength = -1.0f;
+    if (!engine::readActiveWeather(sid, sizeof(sid), &strength)) return;
+    bool changed = (strcmp(sid, weatherSid_) != 0) ||
+                   (fabs(strength - weatherStrength_) > 0.01f);
+    if (!sync::gateShouldSend(changed, now, weatherSendMs_, /*minSendMs*/ 0,
+                              RESEND_MS, /*resendUnsent*/ true))
+        return;
+    strncpy(weatherSid_, sid, sizeof(weatherSid_) - 1);
+    weatherSid_[sizeof(weatherSid_) - 1] = '\0';
+    weatherStrength_ = strength; weatherSendMs_ = now;
+    WeatherPacket pkt;
+    memset(&pkt, 0, sizeof(pkt));
+    pkt.type    = (u8)PKT_WEATHER;
+    pkt.ownerId = ownerId;
+    pkt.seq     = weatherSeqOut_++;
+    strncpy(pkt.sid, sid, sizeof(pkt.sid) - 1);
+    pkt.strength = strength;
+    net.queueWeather(pkt);
+    if (changed) {
+        char b[128]; _snprintf(b, sizeof(b) - 1,
+            "[weather] SEND sid='%s' strength=%.2f seq=%u", sid, strength, pkt.seq);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+}
+
+void Replicator::applyWeather(const SyncContext& ctx) {
+    GameWorld* gw = ctx.gw; Inbound& in = *ctx.in;
+    std::deque<InboundWeather> got;
+    in.drainWeather(got);
+    if (got.empty()) return;
+    if (!weatherSync_) return;
+    for (std::deque<InboundWeather>::iterator it = got.begin(); it != got.end(); ++it) {
+        const WeatherPacket& p = it->pkt;
+        if (!sync::gateSeqAccept(weatherSeqSeen_, p.seq)) continue; // stale/dup row
+        weatherSeqSeen_ = p.seq;
+        if (!p.sid[0]) continue;
+        bool ok = engine::applyActiveWeather(gw, p.sid, p.strength);
+        char b[128]; _snprintf(b, sizeof(b) - 1,
+            "[weather] RECV sid='%s' strength=%.2f ok=%d seq=%u",
+            p.sid, p.strength, ok ? 1 : 0, p.seq);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+}
+
 void Replicator::publishBuilds(const SyncContext& ctx) {
     NetLink& net = *ctx.net; u32 ownerId = ctx.localId;
     if (!buildSync_) return;
@@ -1303,7 +1364,8 @@ void Replicator::driveSampledChannels(const SyncContext& ctx) {
         { &Replicator::buildSync_,    0,                     &Replicator::publishBuilds,     &Replicator::applyBuilds,     false },
         { &Replicator::buildSync_,    &Replicator::bdoorSync_, &Replicator::publishBuildDoors, &Replicator::applyBuildDoors, false },
         { &Replicator::prodSync_,     0,                     &Replicator::publishProd,       &Replicator::applyProd,       true  },
-        { &Replicator::researchSync_, 0,                     &Replicator::publishResearch,   &Replicator::applyResearch,   true  }
+        { &Replicator::researchSync_, 0,                     &Replicator::publishResearch,   &Replicator::applyResearch,   true  },
+        { &Replicator::weatherSync_,  0,                     &Replicator::publishWeather,    &Replicator::applyWeather,    true  }
     };
     const int n = (int)(sizeof(kCh) / sizeof(kCh[0]));
     for (int i = 0; i < n; ++i) {
