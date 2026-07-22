@@ -60,16 +60,17 @@ function Test-ShopProbe {
     if ($null -eq $hostBuy) { $why += "host never logged its SHOPBUY attempt" }
     if ($null -eq $joinBuy) { $why += "join never logged its SHOPBUY attempt" }
 
-    # 4. Both scripted wallet writes logged (the 1b apply-primitive check + the
-    #    decisive crossing lever: side-distinct sentinels, host 5000 / join 7000).
-    $setRegex = 'SCENARIO WALLETSET who=(host|join) rank=(\d+) target=(-?\d+) ok=(\d) before=(-?\d+) after=(-?\d+)'
+    # 4. Both scripted wallet writes logged (the apply-primitive check: each side
+    #    ADDS a side-distinct amount to the shared faction wallet - host +4000,
+    #    join +6000. With money sync OFF the deltas do NOT cross - the baseline).
+    $setRegex = 'SCENARIO WALLETSET who=(host|join) rank=\d+ add=(-?\d+) ok=(\d) before=(-?\d+) after=(-?\d+)'
     $hostSet = Select-String -Path $HostFile -Pattern $setRegex -ErrorAction SilentlyContinue | Select-Object -Last 1
     $joinSet = Select-String -Path $JoinFile -Pattern $setRegex -ErrorAction SilentlyContinue | Select-Object -Last 1
     if ($null -eq $hostSet) { $why += "host never logged its WALLETSET" }
     if ($null -eq $joinSet) { $why += "join never logged its WALLETSET" }
     $hostSetOk = $false; $joinSetOk = $false
-    if ($hostSet) { $hostSetOk = ($hostSet.Matches[0].Groups[4].Value -eq '1') -and ($hostSet.Matches[0].Groups[6].Value -eq $hostSet.Matches[0].Groups[3].Value) }
-    if ($joinSet) { $joinSetOk = ($joinSet.Matches[0].Groups[4].Value -eq '1') -and ($joinSet.Matches[0].Groups[6].Value -eq $joinSet.Matches[0].Groups[3].Value) }
+    if ($hostSet) { $hostSetOk = ($hostSet.Matches[0].Groups[3].Value -eq '1') -and ([int]$hostSet.Matches[0].Groups[5].Value -eq [int]$hostSet.Matches[0].Groups[4].Value + [int]$hostSet.Matches[0].Groups[2].Value) }
+    if ($joinSet) { $joinSetOk = ($joinSet.Matches[0].Groups[3].Value -eq '1') -and ([int]$joinSet.Matches[0].Groups[5].Value -eq [int]$joinSet.Matches[0].Groups[4].Value + [int]$joinSet.Matches[0].Groups[2].Value) }
 
     # FINDING A: final wallet divergence per rank (does anything cross today?).
     $rankDiv = @{}
@@ -144,14 +145,15 @@ function Test-ShopProbe {
                             walletDiv = $rankDivMetric } -Detail $detail)
 }
 
-# money_sync (protocol 22, moneySync ON): the wallet-channel gate. Same script
-# as shop_probe minus the vendor legs: each side writes a side-distinct wallet
-# sentinel into the tab it OWNS (host rank0=5000, join rank1=7000) and the
-# channel must carry it across - the gate is CONVERGENCE:
-#   1. both WALLETSET writes succeeded (apply primitive works);
-#   2. the peer's WALLET series ends at the sender's sentinel for that rank
-#      (a "[money] RECV" landed and stuck);
-#   3. every rank readable on both sides ends converged (no drift elsewhere).
+# money_sync (protocol 22b, moneySync ON): the shared-wallet gate. The player's
+# real money is ONE shared per-faction pool (engine::readPlayerWallet), so the
+# channel replicates DELTAS: host ADDS +add_h, join ADDS +add_j, and both sides'
+# pools must CONVERGE to base + add_h + add_j (each side sees the peer's delta).
+# The gate:
+#   1. both WALLETSET writes succeeded (ok=1, after=before+add);
+#   2. host and join final WALLET (rank 0) are EQUAL (the shared pool converged);
+#   3. that final reflects BOTH deltas (final == host-before + add_h + add_j),
+#      i.e. neither side's contribution was lost (what absolute sync would do).
 function Test-MoneySync {
     param([string]$HostFile, [string]$JoinFile)
     $why = @()
@@ -161,49 +163,50 @@ function Test-MoneySync {
     if ($hw.Keys.Count -eq 0) { $why += "host logged no WALLET series" }
     if ($jw.Keys.Count -eq 0) { $why += "join logged no WALLET series" }
 
-    $setRegex = 'SCENARIO WALLETSET who=(host|join) rank=(\d+) target=(-?\d+) ok=(\d) before=(-?\d+) after=(-?\d+)'
+    $setRegex = 'SCENARIO WALLETSET who=(host|join) rank=\d+ add=(-?\d+) ok=(\d) before=(-?\d+) after=(-?\d+)'
     $hostSet = Select-String -Path $HostFile -Pattern $setRegex -ErrorAction SilentlyContinue | Select-Object -Last 1
     $joinSet = Select-String -Path $JoinFile -Pattern $setRegex -ErrorAction SilentlyContinue | Select-Object -Last 1
     if ($null -eq $hostSet) { $why += "host never logged its WALLETSET" }
     if ($null -eq $joinSet) { $why += "join never logged its WALLETSET" }
     foreach ($pair in @(@('host', $hostSet), @('join', $joinSet))) {
         $side = $pair[0]; $s = $pair[1]
-        if ($s -and (($s.Matches[0].Groups[4].Value -ne '1') -or
-                     ($s.Matches[0].Groups[6].Value -ne $s.Matches[0].Groups[3].Value))) {
-            $why += "$side WALLETSET write failed (ok/after mismatch)"
+        if ($s) {
+            $add = [int]$s.Matches[0].Groups[2].Value
+            $before = [int]$s.Matches[0].Groups[4].Value
+            $after = [int]$s.Matches[0].Groups[5].Value
+            if (($s.Matches[0].Groups[3].Value -ne '1') -or ($after -ne $before + $add)) {
+                $why += "$side WALLETSET write failed (ok/after mismatch)"
+            }
         }
     }
 
-    # Crossing: the peer's final money at the sender's rank equals the sentinel.
-    $crossed = 0; $expected = 0
-    foreach ($leg in @(@($hostSet, $jw, 'host->join'), @($joinSet, $hw, 'join->host'))) {
-        $s = $leg[0]; $peer = $leg[1]; $tag = $leg[2]
-        if ($null -eq $s) { continue }
-        $rank = [int]$s.Matches[0].Groups[2].Value
-        $tgt  = [int]$s.Matches[0].Groups[3].Value
-        $expected++
-        if (-not $peer.ContainsKey($rank)) { $why += "$tag rank $rank absent from peer WALLET series"; continue }
-        $end = $peer[$rank][$peer[$rank].Count - 1].money
-        if ($end -eq $tgt) { $crossed++ }
-        else { $why += "$tag sentinel did not cross (peer rank $rank ended $end, want $tgt)" }
-    }
+    $addH = if ($hostSet) { [int]$hostSet.Matches[0].Groups[2].Value } else { 0 }
+    $addJ = if ($joinSet) { [int]$joinSet.Matches[0].Groups[2].Value } else { 0 }
+    $hostBefore = if ($hostSet) { [int]$hostSet.Matches[0].Groups[4].Value } else { -1 }
 
-    # No drift on any co-visible rank.
-    $diverged = @()
-    foreach ($r in $hw.Keys) {
-        if (-not $jw.ContainsKey($r)) { continue }
-        $hEnd = $hw[$r][$hw[$r].Count - 1].money
-        $jEnd = $jw[$r][$jw[$r].Count - 1].money
-        if ($hEnd -ge 0 -and $jEnd -ge 0 -and $hEnd -ne $jEnd) { $diverged += "rank$r($hEnd/$jEnd)" }
+    # Both sides' shared pool (rank 0) must end EQUAL and reflect both deltas.
+    $crossed = 0; $expected = 2
+    $hEnd = if ($hw.ContainsKey(0)) { $hw[0][$hw[0].Count - 1].money } else { -1 }
+    $jEnd = if ($jw.ContainsKey(0)) { $jw[0][$jw[0].Count - 1].money } else { -1 }
+    if ($hEnd -lt 0 -or $jEnd -lt 0) {
+        $why += "shared wallet series missing (host=$hEnd join=$jEnd)"
+    } else {
+        if ($hEnd -ne $jEnd) { $why += "pools diverged (host=$hEnd join=$jEnd)" }
+        else {
+            $wantFinal = $hostBefore + $addH + $addJ
+            # host delta present on the join side (join saw host's contribution)
+            if ($jEnd -eq $wantFinal) { $crossed++ } else { $why += "join pool missing host delta (join=$jEnd want=$wantFinal)" }
+            # join delta present on the host side (host saw join's contribution)
+            if ($hEnd -eq $wantFinal) { $crossed++ } else { $why += "host pool missing join delta (host=$hEnd want=$wantFinal)" }
+        }
     }
-    if ($diverged.Count -gt 0) { $why += ("final wallets diverged: " + ($diverged -join ", ")) }
 
     $v = if ($why.Count -eq 0) { "PASS" } else { "FAIL" }
     $detail = $why -join "; "
-    Write-Host "  MONEY-SYNC $v - crossed=$crossed/$expected $detail"
+    Write-Host "  MONEY-SYNC $v - crossed=$crossed/$expected hostPool=$hEnd joinPool=$jEnd $detail"
     return (Add-GateResult -Name "money_sync" -Status $v `
                 -Metrics @{ crossed = $crossed; expected = $expected
-                            diverged = $diverged.Count } -Detail $detail)
+                            hostPool = $hEnd; joinPool = $jEnd } -Detail $detail)
 }
 
 # recruit_probe (protocol 23 phase 0): mid-session recruitment evidence.
@@ -1862,6 +1865,92 @@ function Test-ProdSync {
                 -Metrics @{ outGap = $outGap; sent = $sent.Count; applied = $recv.Count } -Detail $detail)
 }
 
+# prod_sync_join (protocolo 33, AUTORIDAD POR-OBJETO): ESPEJO de Test-ProdSync
+# con los roles host/join intercambiados. Aqui conduce el JOIN (coloca+opera el
+# banco de crafteo que EL coloco) y el HOST observa. Prueba que:
+#   * el JOIN coloco las maquinas y corrio las patas locales (place/ramp/power/
+#     setitem/operate) - todo en el log del JOIN;
+#   * el WIRE cruzo en sentido JOIN->HOST: el join emitio [prod] SEND y el host
+#     los aplico ([prod] RECV) - IMPOSIBLE antes de este fix (el join no
+#     publicaba);
+#   * el banco que el host MINTEO del join convergio al outAmt operado por el
+#     join (gap <= 1.0) => el host ve el crafteo del join y NO lo revierte.
+# Un PASS aqui es la evidencia directa de que el join deja de ser espectador.
+function Test-ProdSyncJoin {
+    param([string]$HostFile, [string]$JoinFile)
+    $why = @()
+    # El CONDUCTOR es el JOIN: su log lleva PRODPLACE y las patas locales.
+    $joinP = Select-String -Path $JoinFile -Pattern $script:ProdPlaceRegex -ErrorAction SilentlyContinue | Select-Object -Last 1
+    if ($null -eq $joinP) { $why += "join never logged its PRODPLACE (no condujo)" }
+    elseif ($joinP.Matches[0].Groups[3].Value -ne '1' -or $joinP.Matches[0].Groups[7].Value -ne '1') {
+        $why += "join machine placement failed (genOk=$($joinP.Matches[0].Groups[3].Value) benchOk=$($joinP.Matches[0].Groups[7].Value))"
+    }
+    $hSeries = Get-ProdSeries -File $HostFile
+    $jSeries = Get-ProdSeries -File $JoinFile
+    if ($hSeries.Keys.Count -eq 0) { $why += "host machine census empty" }
+    if ($jSeries.Keys.Count -eq 0) { $why += "join machine census empty" }
+
+    # Patas locales del CONDUCTOR (join): power write, setProductionItem, operate.
+    $pw = @(Select-String -Path $JoinFile -Pattern $script:ProdPowerRegex -ErrorAction SilentlyContinue)
+    $pwOk = @($pw | Where-Object { $_.Matches[0].Groups[3].Value -eq '1' -and $_.Matches[0].Groups[2].Value -eq $_.Matches[0].Groups[5].Value })
+    if ($pwOk.Count -eq 0) { $why += "join power writes missing/never applied" }
+    $ow = @(Select-String -Path $JoinFile -Pattern $script:ProdOutWriteRegex -ErrorAction SilentlyContinue)
+    $setItem = @($ow | Where-Object { $_.Matches[0].Groups[2].Value -eq 'setitem' }) | Select-Object -Last 1
+    if ($null -eq $setItem -or $setItem.Matches[0].Groups[4].Value -ne '1') { $why += "join native setProductionItem write missing/failed" }
+    $ops = @(Select-String -Path $JoinFile -Pattern $script:ProdOpRegex -ErrorAction SilentlyContinue)
+    if ($ops.Count -eq 0) { $why += "join operate loop never ran" }
+
+    # El WIRE cruzo JOIN->HOST (el nucleo del fix): el join emitio, el host aplico.
+    $sent = @(Select-String -Path $JoinFile -Pattern '\[prod\] SEND key=' -ErrorAction SilentlyContinue)
+    $recv = @(Select-String -Path $HostFile -Pattern '\[prod\] RECV key=' -ErrorAction SilentlyContinue)
+    if ($sent.Count -eq 0) { $why += "join never sent a [prod] row (sigue siendo espectador)" }
+    if ($recv.Count -eq 0) { $why += "host never received/applied a [prod] row del join" }
+    Write-Host "    FINDING: [prod] rows join sent=$($sent.Count) host applied=$($recv.Count)"
+
+    $outGap = -1.0
+    if ($null -ne $joinP) {
+        # Convergencia del banco: el HOST minteo el banco que el join coloco.
+        $benchKey = $joinP.Matches[0].Groups[9].Value
+        $benchLocal = Get-MintLocalHand -PeerFile $HostFile -PlacerKey $benchKey
+        if ($null -eq $benchLocal) { $why += "host never minted the join bench (key=$benchKey)" }
+        elseif (-not $hSeries.ContainsKey($benchLocal)) { $why += "host bench copy (local=$benchLocal) absent from its census" }
+        elseif (-not $jSeries.ContainsKey($benchKey)) { $why += "join bench absent from its own census" }
+        else {
+            $js = $jSeries[$benchKey]; $hs = $hSeries[$benchLocal]
+            $jLast = $js[$js.Count-1].outAmt; $hLast = $hs[$hs.Count-1].outAmt
+            $outGap = [math]::Abs($jLast - $hLast)
+            Write-Host ("    FINDING: bench outAmt join first={0:N3} last={1:N3} host copy first={2:N3} last={3:N3} gap={4:N3}" -f `
+                $js[0].outAmt, $jLast, $hs[0].outAmt, $hLast, $outGap)
+            if ($outGap -gt 1.0) { $why += "bench output diverged (gap $([math]::Round($outGap,3)) > 1.0)" }
+        }
+        # Cruce de energia del generador sobre la copia minteada en el host.
+        $genKey = $joinP.Matches[0].Groups[5].Value
+        $genLocal = Get-MintLocalHand -PeerFile $HostFile -PlacerKey $genKey
+        if ($null -eq $genLocal) { $why += "host never minted the join generator (key=$genKey)" }
+        elseif (-not $hSeries.ContainsKey($genLocal)) { $why += "host generator copy (local=$genLocal) absent from its census" }
+        else {
+            $gs = $hSeries[$genLocal]
+            $offW = @($pw | Where-Object { $_.Matches[0].Groups[2].Value -eq '0' }) | Select-Object -Last 1
+            if ($null -ne $offW) {
+                $wt = [long]$offW.Matches[0].Groups[7].Value
+                $hit = @($gs | Where-Object { $_.t -ge $wt -and $_.t -le ($wt + 6000) -and $_.power -eq 0 })
+                if ($hit.Count -eq 0) { $why += "join power OFF never crossed onto the host generator copy" }
+                else { Write-Host "    FINDING: join power OFF CROSSED ($($hit.Count) host samples within 6 s)" }
+            }
+            $hFinalPwr = $gs[$gs.Count-1].power
+            $jFinalPwr = if ($jSeries.ContainsKey($genKey)) { $jSeries[$genKey][$jSeries[$genKey].Count-1].power } else { -1 }
+            Write-Host "    FINDING: final generator power join=$jFinalPwr host=$hFinalPwr"
+            if ($jFinalPwr -ge 0 -and $hFinalPwr -ne $jFinalPwr) { $why += "final generator power disagrees (join=$jFinalPwr host=$hFinalPwr)" }
+        }
+    }
+
+    $v = if ($why.Count -eq 0) { "PASS" } else { "FAIL" }
+    $detail = $why -join "; "
+    Write-Host "  PROD-SYNC-JOIN $v - outGap=$([math]::Round($outGap,3)) sent=$($sent.Count) applied=$($recv.Count) $detail"
+    return (Add-GateResult -Name "prod_sync_join" -Status $v `
+                -Metrics @{ outGap = $outGap; sent = $sent.Count; applied = $recv.Count } -Detail $detail)
+}
+
 # Parse the 1 Hz SCENARIO RESEARCH subject poll into ordered samples
 # @{known; can; t} (protocol 38).
 function Get-ResearchSeries {
@@ -2285,24 +2374,34 @@ function Test-VendorTrade {
     $hInv = Get-TinvFinal $HostFile
     $jInv = Get-TinvFinal $JoinFile
 
+    # 2. Wallet (protocol 22b): the SHARED faction pool (rank 0). Both sides'
+    #    debits (-PRICE each) plus both seeds land on the ONE pool, so both series
+    #    must CONVERGE to the same final AND that final must reflect BOTH debits
+    #    (the pool dropped by 2*PRICE from its peak = both spends crossed).
     $crossed = 0
-    foreach ($leg in @(@($hostTrade, $jw, 'host->join'), @($joinTrade, $hw, 'join->host'))) {
-        $t = $leg[0]; $peerW = $leg[1]; $tag = $leg[2]
-        if ($null -eq $t -or $t.Matches[0].Groups[3].Value -ne '1') { continue }
-        $rank   = [int]$t.Matches[0].Groups[2].Value
-        $wAfter = [int]$t.Matches[0].Groups[7].Value
-        # 2. wallet debit crossed.
-        if (-not $peerW.ContainsKey($rank)) { $why += "$tag rank $rank absent from peer WALLET series" }
-        else {
-            $end = $peerW[$rank][$peerW[$rank].Count - 1].money
-            if ($end -eq $wAfter) { $crossed++ }
-            else { $why += "$tag wallet debit did not cross (peer rank $rank ended $end, want $wAfter)" }
-        }
-        # 3. inventory content converged.
+    $hPool = if ($hw.ContainsKey(0)) { $hw[0] } else { @() }
+    $jPool = if ($jw.ContainsKey(0)) { $jw[0] } else { @() }
+    if ($hPool.Count -eq 0 -or $jPool.Count -eq 0) {
+        $why += "shared WALLET series missing (host=$($hPool.Count) join=$($jPool.Count) samples)"
+    } else {
+        $hEnd = $hPool[$hPool.Count - 1].money
+        $jEnd = $jPool[$jPool.Count - 1].money
+        $peak = 0
+        foreach ($s in $hPool) { if ($s.money -gt $peak) { $peak = $s.money } }
+        foreach ($s in $jPool) { if ($s.money -gt $peak) { $peak = $s.money } }
+        $price = if ($hostTrade) { [int]$hostTrade.Matches[0].Groups[5].Value } else { 250 }
+        if ($hEnd -ne $jEnd) { $why += "shared pool diverged (host=$hEnd join=$jEnd)" }
+        elseif ($peak - $hEnd -ne 2 * $price) { $why += "pool did not reflect both debits (peak=$peak final=$hEnd drop=$($peak - $hEnd) want=$(2*$price))" }
+        else { $crossed = 2 }
+    }
+
+    # 3. Inventory content converged for each traded tab (host added to rank 0,
+    #    join to rank 1); the bought item crossed via the inventory channel.
+    foreach ($rank in @(0, 1)) {
         if (-not ($hInv.ContainsKey($rank) -and $jInv.ContainsKey($rank))) {
-            $why += "$tag rank $rank TINV series missing on a side"
+            $why += "rank $rank TINV series missing on a side"
         } elseif ($hInv[$rank].hash -ne $jInv[$rank].hash) {
-            $why += "$tag rank $rank inventory hash diverged (host $($hInv[$rank].hash) join $($jInv[$rank].hash))"
+            $why += "rank $rank inventory hash diverged (host $($hInv[$rank].hash) join $($jInv[$rank].hash))"
         }
     }
 
@@ -2387,5 +2486,48 @@ function Test-WeatherSync {
     $d = "$($sent.Count) host transition(s) but none received on join yet (delivery timing)"
     Write-Host "  WEATHER-SYNC SKIP - $d"
     return (Add-GateResult -Name "weather_sync" -Status SKIP -Metrics $met -Detail $d)
+}
+
+# world_item_peer_pickup: NON-gear ground-item cross-client PICKUP conservation.
+# The HOST drops a common non-gear item (streams a W1 proxy); the JOIN picks that
+# proxy up into its own rank-1 bag. Every copy of the sid the client can see is
+# summed (rank0 + rank1 + ground); the conservation invariant is total <= 1 at all
+# times. The DUPE manifests on the HOST (its real dropped item stays on the ground
+# AND the join's picked-up copy mirrors back), so the gate is host maxtot<=1 AND
+# fintot==1. Both the drop (host) and the pickup (join) must be exercised, else the
+# gate would pass vacuously on a run where nothing happened.
+function Test-WorldItemPeerPickup {
+    param([string]$HostFile, [string]$JoinFile)
+    $rxHost = 'WPU verdict role=host pass=(\d+) dropped=(-?\d+) maxtot=(-?\d+) fintot=(-?\d+)'
+    $rxJoin = 'WPU verdict role=join pass=(\d+) picked=(-?\d+) maxtot=(-?\d+) fintot=(-?\d+)'
+    $dropped = -1; $hMax = -1; $hFin = -1; $picked = -1; $jMax = -1
+    if (Test-Path $HostFile) {
+        $hl = Select-String -Path $HostFile -Pattern $rxHost -ErrorAction SilentlyContinue | Select-Object -Last 1
+        if ($null -ne $hl) {
+            $g = $hl.Matches[0].Groups
+            $dropped = [int]$g[2].Value; $hMax = [int]$g[3].Value; $hFin = [int]$g[4].Value
+        } else { Write-Host "  WI-PEER-PICKUP [host] no WPU verdict" }
+    }
+    if (Test-Path $JoinFile) {
+        $jl = Select-String -Path $JoinFile -Pattern $rxJoin -ErrorAction SilentlyContinue | Select-Object -Last 1
+        if ($null -ne $jl) {
+            $g = $jl.Matches[0].Groups
+            $picked = [int]$g[2].Value; $jMax = [int]$g[3].Value
+        } else { Write-Host "  WI-PEER-PICKUP [join] no WPU verdict" }
+    }
+    $why = @()
+    if ($dropped -le 0) { $why += "drop not exercised (dropped=$dropped)" }
+    if ($picked -le 0)  { $why += "pickup not exercised (picked=$picked)" }
+    if ($hMax -gt 1)    { $why += "DUPE on host (maxtot=$hMax > 1)" }
+    if ($hFin -ne 1)    { $why += "host did not settle to one copy (fintot=$hFin)" }
+    $v = if ($why.Count -eq 0) { "PASS" } else { "FAIL" }
+    $detail = $why -join "; "
+    Write-Host "  WI-PEER-PICKUP $v - dropped=$dropped picked=$picked host(max=$hMax fin=$hFin) join(max=$jMax) $detail"
+    if ($hMax -ge 2) {
+        Write-Host "    NOTE: host saw 2 copies => the peer's proxy pickup was not conserved (host kept its real ground item + gained the join's mirrored copy)"
+    }
+    return (Add-GateResult -Name "wi_peer_pickup" -Status $v `
+                -Metrics @{ dropped = $dropped; picked = $picked; hostMax = $hMax;
+                            hostFin = $hFin; joinMax = $jMax } -Detail $detail)
 }
 

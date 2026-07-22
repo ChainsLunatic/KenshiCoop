@@ -61,7 +61,7 @@ struct Config {
     unsigned int interpMaxExtrapMs; // KENSHICOOP_INTERP_MAX_EXTRAP_MS (250)
     unsigned int interpStaleMs;     // KENSHICOOP_INTERP_STALE_MS      (2000)
     float        interpSnapDist;    // KENSHICOOP_INTERP_SNAP_DIST     (50 u)
-    float        catchupK;          // KENSHICOOP_CATCHUP_K            (2.0)
+    float        catchupK;          // KENSHICOOP_CATCHUP_K            (1.4)
     float        snapDist;          // KENSHICOOP_SNAP_DIST            (8 u)
     float        snapSeconds;       // KENSHICOOP_SNAP_SECONDS         (0.75 s)
                                     // velocity-aware hard-snap gate: teleport a
@@ -427,6 +427,17 @@ struct Config {
     // the peer camera is co-located (same biome; weather is uniform per biome),
     // and the join applies it to its own active region. "0" is the A/B escape hatch.
     bool          weatherSync;
+    // KENSHICOOP_BOUNTY_SYNC (default ON): bounty/crime sync (protocol 45) -
+    // the HOST is the witness authority (H2, settled by the 2026-07-20 live
+    // run): it samples every durable bounty row on the bodies it carries (its
+    // driven copies of remote PCs, where a join-owned PC's bounty lives, plus
+    // host-owned PCs) ~1 Hz and streams change-gated PKT_BOUNTY rows keyed
+    // per-(character hand, faction sid); the owning client applies each row onto
+    // its own clean copy via the engine's own levers (unfairAddToBounty raise /
+    // clearBounty drop). Without it a character's wanted level is per-client:
+    // a crime one player commits leaves the peer's copy unwanted (spikes 59/60).
+    // Unidirectional host->clients (no echo path). "0" is the A/B escape hatch.
+    bool          bountySync;
 
     // KENSHICOOP_STORE_SYNC (default ON): storage/machine container sync
     // (protocol 34) - the HOST censuses container-bearing buildings (storage
@@ -453,6 +464,15 @@ struct Config {
     // Forced OFF for squad_probe (it measures the unsynced baseline). "0" is
     // the A/B escape hatch.
     bool          squadSync;
+
+    // KENSHICOOP_SHOW_NAMETAG (default ON): floating name label over the OTHER
+    // player's characters (the bodies the host stream DRIVES on this client).
+    // Shows the peer's Steam persona name when known, else "[Remote Player]".
+    // This is a normal-play HUD element (NOT the KENSHICOOP_DEBUG_MARKERS
+    // diagnostic overlay); the F2 panel toggles it live via setShowNametag.
+    // "0" hides it. Runtime-only: the F2 toggle changes the in-memory value,
+    // it is not written back to coop_config.json.
+    bool          showRemoteNametag;
 
     // KENSHICOOP_LATEJOIN_SYNC (default ON): late-join/reconnect resync
     // (protocol 30, no wire change) - on the peer-connect edge the
@@ -483,6 +503,15 @@ struct Config {
     // independent of the transport in use. 0 = off.
     unsigned long long steamPing;
 
+    // Cámara libre local (KENSHICOOP_FREE_CAMERA != "0"; DEFAULT ON). Feature de
+    // conveniencia 100% CLIENTE/VISUAL para capturas y vídeo: la tecla F3 desacopla
+    // la cámara Ogre del personaje y la deja volar con WASD + Q/E + flechas. No
+    // toca ningún canal de sync ni se replica al peer (cada jugador activa la suya
+    // de forma independiente). Solo actúa en sesiones interactivas (scenario vacío
+    // + sin test-seconds), igual que el panel F2, para no perturbar los oráculos.
+    // "0" es la escotilla de escape (deshabilita la tecla por completo).
+    bool          freeCamera;
+
     // In-game co-op panel session control (2026-07-13). When the mod is driven
     // by the F2 panel instead of the env launchers, networking is DEFERRED at
     // load: the session (host listen / client connect) only starts when the
@@ -503,6 +532,14 @@ void loadConfig(Config& out);
 // coop_config.json into 'c'. Called on the panel's Connect so a friend-code edit
 // applies without restarting the game. No-op for keys absent from the file.
 void reloadPeerFromFile(Config& c);
+
+// Persist / read the friend SteamID last pasted in the F2 panel. Stored in a small
+// sibling file (coop_last_peer.txt) next to coop_config.json so a co-op pair does
+// not have to re-paste each other's IDs every launch. saveLastPeer is best-effort
+// (silent on I/O failure) and ignores id 0; loadLastPeer returns 0 when the file is
+// missing or its contents are not a valid SteamID64 (re-validated on read).
+void saveLastPeer(unsigned long long id);
+unsigned long long loadLastPeer();
 
 // One-line summary of the RESOLVED (effective) config - every sync channel's
 // on/off state plus the key tuning knobs - for the startup log. Makes "which

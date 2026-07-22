@@ -27,26 +27,55 @@ const enet_uint8 CH_UNRELIABLE = 1;  // entity batches / stealth / cam (newest s
 const enet_uint8 CH_BULK       = 2;  // coordinated save/load transfer (bulk reliable)
 const int        CH_COUNT      = 3;  // channels negotiated at host-create / connect
 
+// Disconnect reason codes carried in enet_peer_disconnect(peer, data) - ENet
+// delivers 'data' to the peer as event.data on its DISCONNECT event. This is how
+// the HOST tells a REJECTED joiner WHY (the host detects a version mismatch at
+// HELLO, before any WELCOME, so the join otherwise just sees a bare disconnect
+// and no on-screen reason). 0 = normal/graceful (ENet's default); nonzero = a
+// specific reason the peer can map to a user-facing message.
+const enet_uint32 DISCONNECT_VERSION_MISMATCH = 1;
+
 // Net-thread diagnostics. OutputDebugStringA is thread-safe, and CoopLog guards
 // its FILE* with a lock, so both are safe to call off the main thread.
 void netLog(const char* msg) {
-    OutputDebugStringA("[KenshiCoop/net] ");
-    OutputDebugStringA(msg ? msg : "");
-    OutputDebugStringA("\n");
+    // Format prefix + message + newline into one buffer and emit a SINGLE
+    // OutputDebugStringA call. Three separate calls (prefix, msg, "\n") tripled
+    // the debugger-string syscall cost and could interleave with another
+    // thread's output between the fragments; one call is atomic and cheaper.
+    char dbg[288];
+    _snprintf(dbg, sizeof(dbg) - 1, "[KenshiCoop/net] %s\n", msg ? msg : "");
+    dbg[sizeof(dbg) - 1] = '\0';
+    OutputDebugStringA(dbg);
     char buf[256];
     _snprintf(buf, sizeof(buf) - 1, "[net] %s", msg ? msg : "");
     buf[sizeof(buf) - 1] = '\0';
     coop::logLine(buf);
 }
 void netErr(const char* msg) {
-    OutputDebugStringA("[KenshiCoop/net] ERROR: ");
-    OutputDebugStringA(msg ? msg : "");
-    OutputDebugStringA("\n");
+    // Single OutputDebugStringA call, same rationale as netLog (see above).
+    char dbg[288];
+    _snprintf(dbg, sizeof(dbg) - 1, "[KenshiCoop/net] ERROR: %s\n", msg ? msg : "");
+    dbg[sizeof(dbg) - 1] = '\0';
+    OutputDebugStringA(dbg);
     char buf[256];
     _snprintf(buf, sizeof(buf) - 1, "[net] %s", msg ? msg : "");
     buf[sizeof(buf) - 1] = '\0';
     coop::logErrLine(buf);
 }
+
+// Cross-thread UI-error channel backing store (see NetLink.h). The buffer holds
+// the latest player-facing connection-reject reason; the NET thread writes it and
+// the MAIN thread reads it. Wrapped in a global object whose constructor runs at
+// DLL load under the loader lock (single-threaded, before any net thread exists),
+// so the CRITICAL_SECTION is always initialized before first use - no lazy-init
+// race (VC10 has no thread-safe function-local statics).
+struct NetUiErrChannel {
+    CRITICAL_SECTION cs;
+    char             buf[256];
+    NetUiErrChannel() { InitializeCriticalSection(&cs); buf[0] = '\0'; }
+    ~NetUiErrChannel() { DeleteCriticalSection(&cs); }
+};
+NetUiErrChannel g_netUiErr; // constructed at DLL load, destroyed at unload
 
 // Monotonic ms clock for the batch send stamp (v35). QPC, not GetTickCount:
 // the receiver reconstructs snapshot SPACING from consecutive stamps, and
@@ -77,6 +106,31 @@ void pushLocked(CRITICAL_SECTION& cs, std::vector<T>& q, const T& v) {
 }
 } // namespace
 
+// Cross-thread UI-error channel (declared in NetLink.h). setNetUiError() is
+// called on the NET thread; netUiError()/clearNetUiError() on the MAIN thread.
+// All three take the same lock, so the buffer is never read mid-write.
+void setNetUiError(const char* msg) {
+    EnterCriticalSection(&g_netUiErr.cs);
+    _snprintf(g_netUiErr.buf, sizeof(g_netUiErr.buf) - 1, "%s", msg ? msg : "");
+    g_netUiErr.buf[sizeof(g_netUiErr.buf) - 1] = '\0';
+    LeaveCriticalSection(&g_netUiErr.cs);
+}
+const char* netUiError() {
+    // The caller (F2 panel) is MAIN-thread only, so copy the shared buffer into a
+    // MAIN-thread-private static under the lock and hand back a stable pointer -
+    // the returned string can't be torn by a concurrent NET-thread write.
+    static char mainCopy[256];
+    EnterCriticalSection(&g_netUiErr.cs);
+    memcpy(mainCopy, g_netUiErr.buf, sizeof(mainCopy));
+    LeaveCriticalSection(&g_netUiErr.cs);
+    return mainCopy;
+}
+void clearNetUiError() {
+    EnterCriticalSection(&g_netUiErr.cs);
+    g_netUiErr.buf[0] = '\0';
+    LeaveCriticalSection(&g_netUiErr.cs);
+}
+
 NetLink::NetLink()
     : isHost_(false), port_(0),
       enetHost_(0), serverPeer_(0), inbound_(0),
@@ -94,11 +148,13 @@ NetLink::~NetLink() {
 }
 
 bool NetLink::startHost(int port, Inbound* inbound) {
+    clearNetUiError(); // wipe any reject reason from a previous attempt
     isHost_ = true; port_ = port; inbound_ = inbound; myId_ = 0;
     return launchThread();
 }
 
 bool NetLink::startClient(const std::string& ip, int port, Inbound* inbound) {
+    clearNetUiError(); // wipe any reject reason from a previous attempt
     isHost_ = false; ip_ = ip; port_ = port; inbound_ = inbound; myId_ = 0;
     return launchThread();
 }
@@ -209,6 +265,8 @@ void NetLink::queueProd(const ProdPacket& pkt) { pushLocked(outCs_, outProd_, pk
 
 void NetLink::queueResearch(const ResearchPacket& pkt) { pushLocked(outCs_, outResearch_, pkt); }
 void NetLink::queueWeather(const WeatherPacket& pkt) { pushLocked(outCs_, outWeather_, pkt); }
+
+void NetLink::queueBounty(const BountyPacket& pkt) { pushLocked(outCs_, outBounty_, pkt); }
 
 void NetLink::queueBuildPlace(const BuildPlacePacket& pkt) { pushLocked(outCs_, outBuildPlace_, pkt); }
 
@@ -380,6 +438,13 @@ void NetLink::threadLoop() {
     }
 
     u32   nextId = 1;
+    // Number of joins currently holding a live peer slot (host side). Unlike
+    // nextId, which grows monotonically for every admitted join and is never
+    // reset, this rises on admission and falls on disconnect, so it reflects how
+    // many joins are connected AT THE SAME TIME - the real condition the 3+
+    // player guard cares about. A single friend reconnecting after a network
+    // drop must not accumulate here.
+    u32   livePeers = 0;
     DWORD lastConnectAttempt = GetTickCount();
 
     // Wall-clock time-sync state (client only). The join pings every ~2 s; each
@@ -455,18 +520,38 @@ void NetLink::threadLoop() {
                                           (unsigned)h.version, (unsigned)PROTOCOL_VERSION);
                                 b[sizeof(b) - 1] = '\0';
                                 netErr(b);
-                                enet_peer_disconnect(ev.peer, 0);
+                                // Surface the reject on the host's F2 panel too, not
+                                // just the log: the joiner was turned away for a
+                                // version mismatch and the host should see why.
+                                setNetUiError("Rejected a joiner: version mismatch - "
+                                              "update both to the same KenshiCoop build");
+                                // Carry the reason to the join in the disconnect data,
+                                // so the rejected player sees WHY on their own screen
+                                // (they never get a WELCOME to check the version).
+                                enet_peer_disconnect(ev.peer, DISCONNECT_VERSION_MISMATCH);
                             } else {
                                 u32 id = nextId++;
+                                // This join now occupies a live peer slot. Count
+                                // CONCURRENT joins, not the monotonic id: nextId only
+                                // ever grows, so a single friend reconnecting after a
+                                // network drop (CGNAT/flaky link) used to trip the
+                                // guard below on every reconnect (id 2, 3, 4...) even
+                                // though only one join was ever connected at a time.
+                                ++livePeers;
                                 // TWO-PLAYER ASSUMPTION (step-6 guard): the sync model
                                 // is host + ONE join. Join-authored events/inventory/
                                 // conservation intents reach only the host and are NOT
                                 // relayed to other joins, and OWNER_ID_ALL sweeps assume
-                                // a single peer. A third player connects at the wire
-                                // level but will silently desync - fail loudly instead.
-                                if (id >= 2) {
+                                // a single peer. A second SIMULTANEOUS join (a third
+                                // player total) connects at the wire level but will
+                                // silently desync - fail loudly instead.
+                                if (livePeers >= 2) {
                                     netErr("3+ players unsupported: join-authored state is "
                                            "not relayed peer-to-peer; expect desync");
+                                    // A clear, user-visible warning on the host's panel
+                                    // (this is a soft guard - the peer is still admitted).
+                                    setNetUiError("3+ players not supported - "
+                                                  "expect desync");
                                 }
                                 ev.peer->data = (void*)(size_t)id;
                                 WelcomePacket w;
@@ -493,6 +578,11 @@ void NetLink::threadLoop() {
                                           (unsigned)w.version, (unsigned)PROTOCOL_VERSION);
                                 b[sizeof(b) - 1] = '\0';
                                 netErr(b);
+                                // THE key UX fix: the JOIN used to sit on "Connecting..."
+                                // and silently drop to "Offline" here. Publish the real
+                                // reason so the F2 panel/overlay shows it on screen.
+                                setNetUiError("Version mismatch with host - "
+                                              "update both to the same KenshiCoop build");
                             } else {
                                 InterlockedExchange(&myId_, (LONG)w.playerId);
                                 char b[96];
@@ -725,6 +815,14 @@ void NetLink::threadLoop() {
                             && inbound_) {
                             inbound_->pushWeather(wp.ownerId, wp);
                         }
+                    } else if (type == PKT_BOUNTY) {
+                        // Reliable host-authoritative bounty/crime row
+                        // (protocol 45), applied via the BountyManager levers.
+                        BountyPacket bp;
+                        if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &bp)
+                            && inbound_) {
+                            inbound_->pushBounty(bp.ownerId, bp);
+                        }
                     } else if (type == PKT_BUILD_PLACE) {
                         // Reliable placed-building announcement (protocol 27):
                         // describe/mint edge, keyed by the placer's hand.
@@ -904,6 +1002,11 @@ void NetLink::threadLoop() {
                     if (isHost_) {
                         u32 id = (u32)(size_t)ev.peer->data;
                         ev.peer->data = 0;
+                        // Only admitted joins (id != 0, set after a successful
+                        // HELLO) ever incremented livePeers; peers rejected before
+                        // admission (version mismatch) never did, so don't
+                        // decrement for them. Guard against underflow regardless.
+                        if (id != 0 && livePeers > 0) --livePeers;
                         if (inbound_) inbound_->pushLeave(id);
                         char b[64];
                         _snprintf(b, sizeof(b) - 1, "peer disconnected id=%u", (unsigned)id);
@@ -912,6 +1015,14 @@ void NetLink::threadLoop() {
                     } else {
                         serverPeer_ = 0;
                         if (inbound_) inbound_->pushLeave(OWNER_ID_ALL);
+                        // The host may have carried a reject reason in the disconnect
+                        // data (version mismatch): surface it so the JOIN shows WHY on
+                        // screen instead of silently dropping to "Offline".
+                        if (ev.data == DISCONNECT_VERSION_MISMATCH) {
+                            netErr("host rejected us: protocol/version mismatch");
+                            setNetUiError("Version mismatch with host - "
+                                          "update both to the same KenshiCoop build");
+                        }
                         netLog("disconnected from host");
                     }
                     break;
@@ -1356,6 +1467,27 @@ void NetLink::threadLoop() {
         LeaveCriticalSection(&outCs_);
         for (size_t i = 0; i < weatherPkts.size(); ++i) {
             ENetPacket* out = enet_packet_create(&weatherPkts[i], sizeof(WeatherPacket),
+                                                 ENET_PACKET_FLAG_RELIABLE);
+            if (isHost_) {
+                enet_host_broadcast(enetHost_, CH_RELIABLE, out);
+            } else if (serverPeer_ && serverPeer_->state == ENET_PEER_STATE_CONNECTED) {
+                enet_peer_send(serverPeer_, CH_RELIABLE, out);
+            } else {
+                enet_packet_destroy(out);
+            }
+        }
+
+        // Drain + send any queued bounty/crime rows on CH_RELIABLE (protocol
+        // 44). Host -> joins only (the Replicator only publishes on the host);
+        // change-gated + safety-resent by the caller, so a settled wanted level
+        // is near-silent. A lost row would leave a bounty diverged until the
+        // safety resend, so reliable is the right channel.
+        std::vector<BountyPacket> bountyPkts;
+        EnterCriticalSection(&outCs_);
+        bountyPkts.swap(outBounty_);
+        LeaveCriticalSection(&outCs_);
+        for (size_t i = 0; i < bountyPkts.size(); ++i) {
+            ENetPacket* out = enet_packet_create(&bountyPkts[i], sizeof(BountyPacket),
                                                  ENET_PACKET_FLAG_RELIABLE);
             if (isHost_) {
                 enet_host_broadcast(enetHost_, CH_RELIABLE, out);

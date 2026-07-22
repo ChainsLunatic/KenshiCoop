@@ -70,7 +70,8 @@ enum PacketType {
     PKT_RESEARCH         = 40,// RELIABLE host-authoritative known-research row (protocol 38); ResearchPacket
     PKT_CAM_HINT         = 41,// UNRELIABLE join camera center hint (protocol 43, join -> host); CamHintPacket
     PKT_COMBAT_HIT       = 42,// RELIABLE join-dealt authoritative damage report (join -> host, protocol 45); CombatHitPacket
-    PKT_WEATHER          = 43 // RELIABLE host-authoritative active-biome weather row (protocol 46); WeatherPacket
+    PKT_WEATHER          = 43,// RELIABLE host-authoritative active-biome weather row (protocol 46); WeatherPacket
+    PKT_BOUNTY           = 44 // RELIABLE host-authoritative bounty/crime row (zeroit789 merge, renumbered from 42); BountyPacket
 };
 
 // One-shot transition events carried on the RELIABLE channel. Continuous state
@@ -784,19 +785,23 @@ struct StatsPacket {
     f32 age;                   // Character::getAge (protocol 46); animals scale body size by age. <= 0 = unreadable
 };
 
-// ---- Protocol 22: per-tab wallet snapshot -----------------------------------
-// Owner-authoritative money for ONE player squad tab, keyed by the tab's RANK
-// among the distinct sorted member containers - the same cross-client-stable
-// tab identity the ownership partition uses (a hand key would also work, but
-// rank is what both sides already agree on for "whose tab is whose"). Change-
-// gated with a floor + safety resend (the PKT_STATS pacing); the receiver
-// writes the value via Ownerships::setMoney onto the platoon of that rank's
-// tab leader. money is signed on the wire because the engine field is an int.
+// ---- Protocol 22b: shared player-wallet DELTA -------------------------------
+// The player's real money is ONE per-faction wallet (Faction::factionOwnerships,
+// what the UI shows and shops mutate; confirmed by live RE 2026-07-20 - see
+// engine::readPlayerWallet), shared by the whole squad and by BOTH co-op players
+// (they drive the same save faction). The pre-44 channel replicated the DEAD
+// per-Platoon field by tab RANK, so real money never crossed. Now the channel
+// replicates the shared wallet: each side sends the DELTA of its own local
+// change and the receiver ADDS it (moneyApplyDelta), so concurrent spends from
+// both players sum correctly (1000 - 250 - 100 = 650 on both). Reliable+ordered
+// delivery makes each delta apply exactly once (no safety resend - resending a
+// delta would double-apply). tabRank is unused (kept 0) - the wallet is not
+// per-tab. money is the signed delta (engine field is int).
 struct MoneyPacket {
     u8  type;    // = PKT_MONEY
-    u32 ownerId; // network player id of the sender (the tab's owner)
-    u32 tabRank; // squad-tab rank (0 = host-owned tab, 1 = join-owned, ...)
-    int money;   // Ownerships::money for that tab's platoon
+    u32 ownerId; // network player id of the sender
+    u32 tabRank; // unused (0) - the shared faction wallet is not per-tab
+    int money;   // signed DELTA to apply to the shared faction wallet
 };
 
 // ---- Protocol 24: player-faction relation row --------------------------------
@@ -1260,7 +1265,81 @@ struct TimePongPacket {
     u32 responderWallMs; // host's wallClockMs() at echo
 };
 
+// ---- Protocol 45: host-authoritative bounty/crime row ------------------------
+// ONE per-(character, faction) durable bounty row, keyed by the OWNING
+// character's save-stable hand (the per-character key every other per-character
+// channel uses - BountyManager is inline per-Character, NOT per-squad) plus the
+// faction's GameData stringID (cross-client stable, proven by the faction
+// probe). The HOST is the sole authority (H2 witness-local, settled by the
+// 2026-07-20 live run): only the host's guard simulation runs the
+// witness->assignBountyForCrimes pipeline, so the row lives on the host's
+// driven copy of a join-owned PC while the owner stays clean. The host diffs
+// each row's {amount, crimes, claimed} against a silently-seeded shared-save
+// baseline and streams movement DOWN to the clients; the owning client applies
+// it via the engine's own levers (unfairAddToBounty / clearBounty). Reliable
+// (a lost row would leave the wanted level diverged until the safety resend).
+struct BountyPacket {
+    u8  type;      // = PKT_BOUNTY
+    u32 ownerId;   // network player id of the sender (the HOST = the authority)
+    u32 seq;       // per-sender monotonic (stale-row guard, as PKT_FACTION)
+    u32 hand[5];   // owning character hand [type,container,containerSerial,index,serial]
+    char sid[48];  // faction GameData stringID ("" never sent) - cross-client identity
+    int  amount;   // Bounty::amount (cats) for that (char, faction) row
+    u32  crimes;   // Bounty::crimes bitmask (CrimeEnum bits)
+    u8   claimed;  // Bounty::bountyHasBeenClaimedOnce
+};
+
 #pragma pack(pop)
+
+// ---- Protocol 45: pure bounty decision logic (header-testable) ---------------
+// The side-effect-free core of the channel, extracted so prototest can lock the
+// authority + convergence rules without a live engine (the engine read/write
+// shims stay behind SEH in EngineCharState.cpp). One value triple per row.
+struct BountyVal {
+    int amount;      // Bounty::amount (cats)
+    u32 crimes;      // Bounty::crimes bitmask
+    int claimed;     // Bounty::bountyHasBeenClaimedOnce (0/1)
+};
+
+// HOST publish gate. Host-authoritative (H2): a NON-host caller NEVER publishes
+// its own bounty state (the join must not push its clean/forked copy upstream -
+// there is no echo path). On the host, a row streams only after its baseline is
+// seeded (both clients load the same save, so a bounty already present at load
+// is shared and silent) and either its value MOVED or a safety resend is due.
+// Returns 1 = queue the row, 0 = skip.
+inline int bountyShouldSend(int isHost, int seeded,
+                            const BountyVal* known, const BountyVal* cur,
+                            int resendDue) {
+    if (!isHost) return 0;   // unidirectional host->clients: the join never publishes
+    if (!seeded) return 0;   // first sight seeds the shared-save baseline silently
+    if (!known || !cur) return 0;
+    int changed = (known->amount != cur->amount) ||
+                  (known->crimes != cur->crimes) ||
+                  (known->claimed != cur->claimed);
+    return (changed || resendDue) ? 1 : 0;
+}
+
+// Receiver apply decision. Given the last-applied per-sender seq, the incoming
+// seq, and the target vs currently-live amount on the local (driven) copy,
+// decide what the engine lever must do. Drops stale rows, skips already-
+// converged rows (a resend or the echo of our own apply), else picks the lever:
+// a raise is an additive unfairAddToBounty(delta); a drop to <= 0 is clearBounty.
+enum BountyApplyAction {
+    BOUNTY_APPLY_SKIP_STALE     = 0, // incoming seq <= seqSeen: a newer row already landed
+    BOUNTY_APPLY_SKIP_CONVERGED = 1, // local already equals target: nothing to do
+    BOUNTY_APPLY_CLEAR          = 2, // target <= 0: clearBounty(fac)
+    BOUNTY_APPLY_ADD            = 3  // non-zero delta: unfairAddToBounty(fac, delta)
+};
+inline int bountyApplyDecision(u32 seqSeen, u32 incomingSeq,
+                               int targetAmount, int currentAmount,
+                               int* outDelta) {
+    if (outDelta) *outDelta = 0;
+    if (seqSeen != 0 && incomingSeq <= seqSeen) return BOUNTY_APPLY_SKIP_STALE;
+    if (targetAmount == currentAmount)          return BOUNTY_APPLY_SKIP_CONVERGED;
+    if (targetAmount <= 0)                      return BOUNTY_APPLY_CLEAR;
+    if (outDelta) *outDelta = targetAmount - currentAmount;
+    return BOUNTY_APPLY_ADD;
+}
 
 // Returns the packet type tag (first byte) of a received buffer, or 0 if empty.
 inline u8 packetType(const void* data, unsigned int len) {

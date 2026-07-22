@@ -279,11 +279,19 @@ void  markerDestroy(void* label);
 // True while any inventory/trade window is open (the engine UI holds Item
 // pointers). Inventory-sync must not free items during this window. SEH-guarded.
 bool  inventoryUiOpen();
+// ---- Cámara libre local (capturas / vídeo) ----------------------------------
+// Modo de cámara libre reimplementado sobre 1.0.65 (el free-cam nativo solo
+// existe en 1.0.68). Llamado por-frame desde mainLoop_hook DESPUÉS del motor.
+// 'enabled' = master-switch de config (KENSHICOOP_FREE_CAMERA). La tecla F3
+// hace el toggle en runtime. 100% local/visual: no toca red ni sync. Definido
+// en FreeCamera.cpp; SEH-guarded internamente (no-op ante cualquier fallo).
+void freeCameraTick(GameWorld* gw, bool enabled);
 
 // ---- In-game co-op session panel ---------------------------------------------
 // Moved to EngineUi.h (Phase 5a domain split): CoopPanelState, CoopConnectFn,
-// CoopDisconnectFn, coopPanelTick, coopOverlayTick. The UI root (Plugin.cpp)
-// includes EngineUi.h directly; the adapter (EngineInternal.h) re-includes it.
+// CoopDisconnectFn, CoopNametagToggleFn, coopPanelTick, coopOverlayTick. The UI
+// root (Plugin.cpp) includes EngineUi.h directly; the adapter (EngineInternal.h)
+// re-includes it.
 
 // ---- Deterministic test-scene setup (host-side; baked into a save) ---------
 // Moved to EngineScenario.h (Phase 5a domain split): spawnSeatInFront,
@@ -762,6 +770,15 @@ unsigned int captureWeaponPtrs(GameWorld* gw, const unsigned int cHand[5],
 // relocateWeaponToGround. Returns 1 on success. `item` must be a still-live tracked object.
 int addItemPtrToInventory(GameWorld* gw, const unsigned int targetHand[5], void* item);
 
+// SEH-guarded (auto-revert mitigation, W1 non-gear pickup): a ground proxy that a
+// PEER picked up (it now sits in some character's inventory) must NOT be retained -
+// the authoring client still holds the real object, so keeping the picked-up proxy
+// duplicates it. Re-drop the proxy back onto the ground at (x,y,z) via the engine's
+// own Inventory::dropItem (a clean bag->ground move, NEVER a destroy). Returns 1 if
+// the object was in an inventory and got dropped, else 0 (already on the ground /
+// stale / not in an inventory).
+int dropProxyItemToGround(GameWorld* gw, void* item, float x, float y, float z);
+
 // ---- Equipped-gear (armour/weapon slot) test hooks (inv_equip scenario) ----
 // SEH-guarded: report the first EQUIPPED item worn by the object at cHand (its
 // template stringID + itemType) and the total count of worn items. Returns 1 if any
@@ -1162,6 +1179,59 @@ int readSlaveState(Character* c);
 // the env var is unset; SEH-guarded per body. `isHost` only tags the line.
 void shackleDbgTick(GameWorld* gw, bool isHost);
 bool shackleDbgOn();
+// Spike 59: env-gated ([bounty], KENSHICOOP_BOUNTY_PROBE) read-only observer
+// for the engine's bounty/crime system - the SYNC_GAPS gap-3 "remaining edge"
+// that so far only has indirect [fac] AFFECT cause evidence. Character::crimes
+// is an INLINE BountyManager at Character+0xF0 (KenshiLib PDB layout);
+// BountyManager::me points back at the owning Character and is checked as a
+// validity sentinel BEFORE any parse (a mismatch logs one SENTINEL-MISMATCH
+// tripwire and reads nothing). Enumerates the local player squad + nearby
+// world NPCs ~1 Hz and logs only bodies with live crime/bounty state, plus a
+// 10 s [bounty] SCAN heartbeat (valid==n is the layout-health signal). No-op
+// when the env var is unset; SEH-guarded per body; zero behavior change.
+void bountyProbeTick(GameWorld* gw, bool isHost);
+bool bountyProbeOn();
+
+// Protocol 45: bounty/crime sync engine shims (the SEH-guarded read/write
+// levers the host-authoritative PKT_BOUNTY channel rides on).
+// ONE durable bounty row a host-side character carries (its own hand + the
+// faction sid + the Bounty value). Emitted per (character, faction) pair by the
+// enumeration below; the publisher keys the wire packet by these.
+struct BountyPubRow {
+    unsigned int hand[5];  // owning character hand (readObjectHand layout)
+    char         sid[48];  // faction GameData stringID (cross-client identity)
+    int          amount;   // Bounty::amount (cats)
+    unsigned int crimes;   // Bounty::crimes bitmask (CrimeEnum bits)
+    int          claimed;  // Bounty::bountyHasBeenClaimedOnce (0/1)
+};
+// SEH-guarded: enumerate every durable bounty row on the characters this engine
+// carries (the same subject set the probe scans - local player squad + nearby
+// world NPCs, which on the host includes its DRIVEN copies of join-owned PCs
+// where the H2 row lives). One BountyPubRow per (character, faction). The
+// BountyManager::me sentinel is checked per body before any parse. Returns the
+// count written (rows only, bodies with no live bounty contribute none).
+unsigned int enumBountyRows(GameWorld* gw, BountyPubRow* out, unsigned int maxOut);
+// Manual-validation helper (host only, KENSHICOOP_AUTOCRIME): programmatically
+// assign a test bounty to the player-squad character at playerIndex via the
+// engine's OWN unfairAddToBounty lever, against the first real world faction.
+// On the host in inhabit mode a non-zero index is a JOIN-owned character's
+// DRIVEN copy, so this reproduces the exact H2 state (a bounty on the host's
+// copy of a join-owned PC) the replication channel must then carry to the owner
+// WITHOUT relying on a hand-driven witnessed crime. Fills outHand (readObjectHand
+// layout) + outSid (the enforcer faction). Returns true when the bounty landed.
+bool injectTestBounty(GameWorld* gw, unsigned int playerIndex, int amount,
+                      unsigned int outHand[5], char* outSid, unsigned int sidLen);
+
+// SEH-guarded: apply one received bounty row onto the local (owning) copy of
+// the character at hand, for the faction sid, via the engine's OWN levers -
+// unfairAddToBounty for a raise, clearBounty for a drop to zero (never a raw
+// map poke, so derived expiry/GUI stay consistent). Convergence-first: a row
+// already equal to getActualBounty is a no-op. outBefore/outAfter capture the
+// (char, faction) amount around the write for the RECV log. Returns true when
+// the character + faction resolved locally and the lever ran (or was a no-op).
+bool applyBountyRow(GameWorld* gw, const unsigned int hand[5], const char* sid,
+                    int amount, unsigned int crimes, int claimed,
+                    int* outBefore, int* outAfter);
 // Place the local occupant into / remove it from the furniture at furnHand via
 // the engine's own setBedMode/setPrisonMode (kind: 1 bed, 2 cage) - pose,
 // attach and transform are engine-native. Idempotent: already in the desired
@@ -1361,6 +1431,16 @@ bool readWalletByHand(const unsigned int mHand[5], int* outMoney);
 // SEH-guarded: write the wallet of the platoon containing the body at mHand via
 // Ownerships::setMoney (the money-sync apply primitive). Returns true on ok.
 bool writeWalletByHand(const unsigned int mHand[5], int money);
+
+// SEH-guarded: read/write the player's REAL wallet - the FACTION wallet
+// (gw->player->participant->factionOwnerships), which is what the UI shows and
+// shops mutate. There is ONE such wallet per player faction, shared by the whole
+// squad (not per-tab). This is the source of truth PKT_MONEY replicates; the
+// per-Platoon walletByHand pair above is the dead field the old channel used.
+// readPlayerWallet: *outMoney = -1 on failure, returns true on ok.
+// writePlayerWallet: money < 0 rejected, returns true on ok.
+bool readPlayerWallet(GameWorld* gw, int* outMoney);
+bool writePlayerWallet(GameWorld* gw, int money);
 
 // Purchase observability detour (protocol 22, 1c groundwork): hook Inventory::
 // buyItem so every REAL trade-UI purchase logs a "[shop] BUY-LOCAL" line
@@ -1738,7 +1818,8 @@ bool writeGameSpeed(GameWorld* gw, float mult, bool paused);
 // GameWorld::setFrameSpeedMultiplier + userPause WITHOUT updating the UI speed
 // buttons and WITHOUT registering as user intent (reentrancy-guarded against
 // the intent hooks). The buttons keep showing the player's last click (their
-// VOTE); the replicator enforces the arbitrated min(host, join) underneath.
+// VOTE); the replicator enforces the host-authoritative effective underneath
+// (host-only authority: a join's click is reverted to the host's speed).
 bool writeGameSpeedQuiet(GameWorld* gw, float mult, bool paused);
 
 // Speed-intent capture (the vote source). Two complementary detectors,

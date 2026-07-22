@@ -283,6 +283,58 @@ bool writeWalletByHand(const unsigned int mHand[5], int money) {
     } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 
+// ---- Protocol 22b: la cartera REAL del jugador (fuente de verdad) ------------
+//
+// Hallazgo de ingenieria inversa en vivo (2026-07-20, kenshi_x64 1.0.65, CE +
+// disassembler contra el proceso host): el dinero que la UI muestra ("Dinero:
+// c.1.000") y que las tiendas mutan NO vive en Platoon::ownerships.money (la
+// cartera per-squad-tab que readWalletByHand/writeWalletByHand tocan - esa esta
+// a 0 y sin uso). Character::getMoney desensamblado hace la cadena:
+//     PlayerInterface (singleton) -> participant (Faction*, +0x2A0)
+//        -> factionOwnerships (Ownerships*, +0x80) -> money (+0x88)
+// Es decir: el dinero del jugador es UNA sola cartera POR FACCION, compartida
+// por todo el squad (todos los tabs). Prueba dura: escribir 31337 en ese
+// Ownerships::money cambio el texto de la UI en el acto; escribir el campo
+// per-Platoon no lo movio. walletOf() (Platoon) es por tanto el campo MUERTO
+// que el canal PKT_MONEY sincronizaba - de ahi que el dinero "no se comparta".
+//
+// playerFactionWallet: el Ownerships de la faccion del jugador local, via el
+// PlayerInterface que cuelga del GameWorld (gw->player, +0x580). Todos los
+// punteros son propiedad del engine; el caller mantiene SEH.
+namespace {
+Ownerships* playerFactionWallet(GameWorld* gw) {
+    if (!gw || !gw->player) return 0;
+    Faction* f = gw->player->participant;  // 0x2A0: la faccion que el jugador controla
+    if (!f) return 0;
+    return f->factionOwnerships;           // 0x80: la cartera compartida del squad
+}
+} // namespace
+
+// SEH-guarded: lee la cartera REAL del jugador (Faction::factionOwnerships).
+// *outMoney = -1 en fallo. Devuelve true si pudo leer.
+bool readPlayerWallet(GameWorld* gw, int* outMoney) {
+    if (outMoney) *outMoney = -1;
+    if (!gw || !outMoney || !g_ownGetMoneyFn) return false;
+    __try {
+        Ownerships* ow = playerFactionWallet(gw);
+        if (!ow) return false;
+        *outMoney = g_ownGetMoneyFn(ow);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+// SEH-guarded: escribe la cartera REAL del jugador via Ownerships::setMoney (el
+// mismo accesor que la UI/tiendas usan). money < 0 se rechaza. Devuelve true ok.
+bool writePlayerWallet(GameWorld* gw, int money) {
+    if (!gw || money < 0 || !g_ownSetMoneyFn) return false;
+    __try {
+        Ownerships* ow = playerFactionWallet(gw);
+        if (!ow) return false;
+        g_ownSetMoneyFn(ow, money);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
 // ---- Protocol 23 phase 0: recruitment probe ---------------------------------
 
 int probeRecruit(GameWorld* gw, bool runtimeSubject,
@@ -1119,26 +1171,60 @@ static GameData* findProdTemplate(GameWorld* gw, int kind, int skip) {
     g_dataScratch.clear();
     g_getDataOfTypeFn(&gw->gamedata, &g_dataScratch, BUILDING);
     unsigned int n = g_dataScratch.size();
+    // Diagnostico de una sola vez: vuelca los primeros edificios (name+sid) para
+    // caracterizar el juego real. Kenshi de Zero corre en es_ES, asi que el
+    // name de DISPLAY esta traducido; por eso ademas del name emparejamos por
+    // stringID (el ID interno de FCS, estable e independiente del idioma).
+    static bool s_dumped = false;
+    if (!s_dumped) {
+        s_dumped = true;
+        char h[96];
+        _snprintf(h, sizeof(h) - 1, "[prod] tmpl-dump BUILDING count=%u", n);
+        h[sizeof(h) - 1] = '\0'; coop::logLine(h);
+        unsigned int cap = n < 60 ? n : 60;
+        for (unsigned int i = 0; i < cap; ++i) {
+            GameData* gd = g_dataScratch[i];
+            if (!gd) continue;
+            char b[224];
+            _snprintf(b, sizeof(b) - 1, "[prod] tmpl[%u] name='%s' sid='%s'",
+                      i, gd->name.c_str(), gd->stringID.c_str());
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+    }
+    // Prefijos en INGLES (casan por stringID) + ESPANOL (casan por name de
+    // display). ciContains es case-insensitive y de subcadena, asi que cada
+    // termino cubre variantes ("Pequeno generador eolico" contiene "generador").
     const char* genPrefs[]   = { "small wind generator", "wind generator",
-                                 "small generator", "generator" };
+                                 "small generator", "generator",
+                                 "generador" };
     const char* craftPrefs[] = { "armour crafting bench", "weapon smithing bench",
-                                 "weapon smith", "engineering bench" };
+                                 "weapon smith", "engineering bench",
+                                 "herreria", "herrer", "armadura",
+                                 "ingenieria", "ingenier", "fabricaci",
+                                 "banco de" };
     const char* storePrefs[] = { "general storage", "storage box", "storage chest",
-                                 "chest", "storage" };
+                                 "chest", "storage",
+                                 "almacen", "caja", "cofre" };
     const char* resPrefs[]   = { "small research bench", "research bench",
-                                 "research" };
+                                 "research",
+                                 "investigaci" };
     const char** prefs;
     unsigned int nPrefs;
-    if (kind == 0)      { prefs = genPrefs;   nPrefs = 4; }
-    else if (kind == 2) { prefs = storePrefs; nPrefs = 5; }
-    else if (kind == 3) { prefs = resPrefs;   nPrefs = 3; }
-    else                { prefs = craftPrefs; nPrefs = 4; }
+    if (kind == 0)      { prefs = genPrefs;   nPrefs = sizeof(genPrefs)/sizeof(genPrefs[0]); }
+    else if (kind == 2) { prefs = storePrefs; nPrefs = sizeof(storePrefs)/sizeof(storePrefs[0]); }
+    else if (kind == 3) { prefs = resPrefs;   nPrefs = sizeof(resPrefs)/sizeof(resPrefs[0]); }
+    else                { prefs = craftPrefs; nPrefs = sizeof(craftPrefs)/sizeof(craftPrefs[0]); }
     GameData* seen[16];
     unsigned int nSeen = 0;
     for (unsigned int k = 0; k < nPrefs; ++k) {
         for (unsigned int i = 0; i < n; ++i) {
             GameData* gd = g_dataScratch[i];
-            if (!gd || !ciContains(gd->name.c_str(), prefs[k])) continue;
+            // Empareja por name (display, puede estar traducido) O por stringID
+            // (interno, estable). Esto arregla el fallo "no template" en es_ES.
+            if (!gd) continue;
+            if (!ciContains(gd->name.c_str(), prefs[k]) &&
+                !ciContains(gd->stringID.c_str(), prefs[k]))
+                continue;
             bool dup = false; // a name can match several prefs
             for (unsigned int s = 0; s < nSeen; ++s)
                 if (seen[s] == gd) { dup = true; break; }

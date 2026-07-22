@@ -25,6 +25,7 @@
 #include "Interp.h"
 #include "../../netproto/Wire.h"
 #include "../core/Inbound.h"
+#include "../core/MoneyReconcile.h"
 #include "../net/NetLink.h"
 #include "SyncContext.h" // Phase 6: per-tick channel call environment
 #include "SyncTuning.h"  // Phase 6d: owned per-channel send-cadence tunables
@@ -82,6 +83,18 @@ public:
     // squad. On a single-tab save only rank 0 exists -> the join owns nothing and the
     // prior one-directional behaviour is preserved.
     void setOwnRanks(const std::set<unsigned int>& r) { ownRanks_ = r; }
+
+    // Remote-player display name for the DRV body nametag (KENSHICOOP_DEBUG_MARKERS).
+    // The plugin root resolves the peer's Steam persona name (net layer) and pushes
+    // it in here each tick so the sync layer stays free of Steam/net dependencies.
+    // Empty -> the label falls back to the legacy "DRV <charName>" form.
+    void setRemoteName(const char* name) { remoteName_ = name ? name : ""; }
+
+    // Normal-play nametag visibility (KENSHICOOP_SHOW_NAMETAG / F2 panel toggle).
+    // Pushed from the plugin root each tick. When false, the per-tick nametag pass
+    // tears down any live name labels so the toggle takes effect immediately (no
+    // reconnect). Independent of KENSHICOOP_DEBUG_MARKERS.
+    void setShowNametag(bool on) { showNametag_ = on; }
 
     // Cross-owner trade veto classifier (engine InvOwnerClassFn). Given a
     // save-stable owner hand (readObjectHand layout [type,container,
@@ -211,6 +224,12 @@ public:
     // reconcile local proxies - spawn a proxy for a new (ownerId, netId), move it if it
     // changed, destroy it on cull. netId spaces are per-sender, culls owner-scoped.
     void applyWorldItems(GameWorld* gw, Inbound& in);
+    // Auto-revert mitigation (W1 non-gear pickup dupe): if a PEER picked up one of
+    // our tracked ground proxies (a real, unowned, pickable object), re-drop it to
+    // the ground before the inventory publish so the peer never retains (and never
+    // mirrors back) a second copy of the authoring client's real item. NOT full
+    // pickup conservation (Phase W4) - it prevents the dupe + keeps the drop visible.
+    void revertProxyPickups(GameWorld* gw);
 
     // BEFORE engine (Phase W2/W3, runs on EVERY client): diff each OWNED character's WEAPON
     // census. A sustained count DECREASE is a DROP (the weapon left the bag; we never mutate
@@ -302,16 +321,16 @@ public:
     // fights accumulate locally (the owner's stream overwrites it).
     void applyStats(GameWorld* gw, Inbound& in);
 
-    // AFTER publishOwned (protocol 22, both clients): stream the WALLET
-    // (Ownerships::money) of every squad tab this client OWNS, keyed by tab
-    // RANK - change-gated on the reliable channel with a ~1 Hz floor and a
-    // periodic safety resend (the publishStats pacing). Kenshi's wallet is
-    // per-Platoon; nothing else about money is on the wire (shop_probe).
+    // AFTER publishOwned (protocol 22b, both clients): publish the DELTA of our
+    // local change to the SHARED player-faction wallet (the real UI/shop wallet,
+    // engine::readPlayerWallet) on the reliable channel. Delta-based so two
+    // concurrent spenders sum correctly; no safety resend (reliable+ordered
+    // delivery applies each delta exactly once). Silent when the wallet is idle.
     void publishMoney(const SyncContext& ctx);
 
-    // BEFORE engine (protocol 22): drain received wallet snapshots and write
-    // each PEER-owned tab's money onto our local copy of that tab's platoon
-    // via Ownerships::setMoney. Never writes a rank we own.
+    // BEFORE engine (protocol 22b): drain received wallet deltas and ADD each to
+    // our local copy of the shared faction wallet (engine::writePlayerWallet),
+    // advancing the baseline so the delta is not re-detected as a local change.
     void applyMoney(const SyncContext& ctx);
 
     // Per-tab wallet sync master enable (KENSHICOOP_MONEY_SYNC).
@@ -429,38 +448,55 @@ public:
     // BEFORE engine (protocol 33, HOST only - the world-simulation
     // authority): sample machine-class buildings near the interest centers
     // (~1 Hz) and stream a PKT_PROD row per machine - the first sight of a
-    // machine SENDS (the host's state IS the baseline, unlike the symmetric
-    // door channel), then change-gated on the quantized fields with a 10 s
-    // safety resend (which is also what keeps a join whose own engine
+    // machine SENDS, then change-gated on the quantized fields with a 10 s
+    // safety resend (which is also what keeps a peer whose own engine
     // drifted converging). Identity: baked hand (keyKind=0) or protocol-27
     // placer key through the build maps (keyKind=1).
+    //
+    // AUTORIDAD POR-OBJETO (ProdAuthority.h): ambos lados llaman a publishProd,
+    // pero cada uno publica SOLO las maquinas de las que es autoridad -> maquina
+    // baked la publica el host; maquina placed la publica quien la coloco. Asi
+    // el JOIN conduce sus propias maquinas de crafteo. ctx.isHost decide la
+    // propiedad de las maquinas baked.
     void publishProd(const SyncContext& ctx);
 
-    // BEFORE engine (protocol 33, join side): drain received machine rows;
-    // resolve the key (baked hand directly; placer key through ownBuilds_/
-    // peerBuilds_), read the local machine, and apply only what actually
-    // diverged through the engine's own levers (switchPowerOn / direct
-    // amount + farm-float writes; a still-null output buffer is first
-    // MATERIALIZED via the native setProductionItem). Per-key seq guard
-    // drops stale rows; unresolvable keys skip silently (out-of-interest).
+    // BEFORE engine (protocol 33): drain received machine rows; resolve the
+    // key (baked hand directly; placer key through ownBuilds_/peerBuilds_),
+    // read the local machine, and apply only what actually diverged through
+    // the engine's own levers (switchPowerOn / direct amount + farm-float
+    // writes; a still-null output buffer is first MATERIALIZED via the native
+    // setProductionItem). Per-key seq guard drops stale rows; unresolvable
+    // keys skip silently (out-of-interest).
+    //
+    // AUTORIDAD POR-OBJETO: aplica SOLO las maquinas de las que este cliente NO
+    // es autoridad -> una fila para una maquina propia (baked siendo host, o
+    // placed que colocamos nosotros) se ignora, evitando que el peer pise
+    // nuestro estado (ese era el bug del join-espectador). ctx.isHost decide.
     void applyProd(const SyncContext& ctx);
 
     // Production machine sync master enable (KENSHICOOP_PROD_SYNC).
     void setProdSync(bool v) { prodSync_ = v; }
 
-    // BEFORE engine (protocol 38, HOST only - the tech-tree authority):
-    // sample the Research store's known set ~1 Hz (Research::isKnown over
-    // the shared RESEARCH GameData enumeration) and stream one PKT_RESEARCH
-    // row per known sid - first sight sends (the host's known set IS the
-    // session baseline), then a safety resend covers a lost row / a join
-    // whose apply lever needed prerequisites that arrived later.
+    // BEFORE engine (protocol 38): sample the Research store's known set ~1 Hz
+    // (Research::isKnown over the shared RESEARCH GameData enumeration) and
+    // stream one PKT_RESEARCH row per known sid - first sight sends, then a
+    // safety resend covers a lost row / a peer whose apply lever needed
+    // prerequisites that arrived later.
+    //
+    // UNION SIMETRICA (CRDT grow-only set): AMBOS lados publican Y aplican. El
+    // conjunto de investigaciones conocidas solo CRECE (startResearch nunca
+    // des-conoce, applyResearch salta lo ya conocido), asi que la union de los
+    // dos conjuntos es libre de conflicto por construccion - no hace falta
+    // arbitraje ni autoridad. Antes era host->join en un solo sentido, por lo
+    // que una investigacion completada por el JOIN nunca llegaba al host; ahora
+    // se propaga en ambos sentidos.
     void publishResearch(const SyncContext& ctx);
 
-    // BEFORE engine (protocol 38, join side): drain received known-research
-    // rows; sids already known locally are skipped (idempotent), the rest
-    // apply through Research::startResearch - the exact lever a research-UI
-    // click commits (flips isKnown in the same tick, spike 401). Per-sid
-    // seq guard drops stale rows.
+    // BEFORE engine (protocol 38): drain received known-research rows; sids
+    // already known locally are skipped (idempotent), the rest apply through
+    // Research::startResearch - the exact lever a research-UI click commits
+    // (flips isKnown in the same tick, spike 401). Per-sid seq guard drops
+    // stale rows. Corre en ambos lados (ver publishResearch: union simetrica).
     void applyResearch(const SyncContext& ctx);
 
     // Research tech-tree sync master enable (KENSHICOOP_RESEARCH_SYNC).
@@ -478,7 +514,7 @@ public:
     void setWeatherSync(bool v) { weatherSync_ = v; }
 
     // Phase 6c: drive the change-gated SAMPLED channels (faction, doors, placed
-    // buildings, placed-building doors, production, research) from one
+    // buildings, placed-building doors, production, research, bounty) from one
     // channel-descriptor registry. Replaces the per-channel if-blocks the tick
     // used to inline: the table owns each channel's master enable, direction
     // (symmetric vs host-authoritative), and cadence ORDER (which must match the
@@ -487,6 +523,27 @@ public:
     // liveness. Money/recruit/squad/stealth/speed/time stay explicit (different
     // cadence positions / patterns).
     void driveSampledChannels(const SyncContext& ctx);
+
+    // BEFORE engine (protocol 45, HOST only - the witness authority settled by
+    // the H2 live run): enumerate every durable bounty row on the bodies this
+    // engine carries (its driven copies of remote PCs, where a join-owned PC's
+    // bounty lives, PLUS host-owned PCs), diff each (char hand, faction sid)
+    // row's {amount, crimes, claimed} against a silently-seeded shared-save
+    // baseline, and stream change-gated PKT_BOUNTY rows (per-sid safety resend).
+    // The join NEVER calls this (host-authoritative, unidirectional host->clients).
+    // Driven from the kCh[] registry (hostAuth row), like publishResearch.
+    void publishBounties(const SyncContext& ctx);
+
+    // BEFORE engine (protocol 45, client side): drain received bounty rows;
+    // each one that resolves to a local character + faction is applied onto the
+    // owning client's (clean) copy through the engine's own levers
+    // (unfairAddToBounty raise / clearBounty drop). The baseline updates BEFORE
+    // the write (echo-free); stale rows (per-key seq guard) and already-converged
+    // rows are skipped; unresolvable hands skip silently (out of interest).
+    void applyBounties(const SyncContext& ctx);
+
+    // Bounty/crime sync master enable (KENSHICOOP_BOUNTY_SYNC).
+    void setBountySync(bool v) { bountySync_ = v; }
 
     // Storage/machine container sync (protocol 34, KENSHICOOP_STORE_SYNC):
     // when set (HOST only - host-authoritative world containers), a ~1 Hz
@@ -524,16 +581,24 @@ public:
     // owner's screen. Never applied to driven copies.
     void applyStealthFeedback(GameWorld* gw, Inbound& in);
 
-    // BEFORE engine (consensus game-speed sync, runs on BOTH clients):
+    // BEFORE engine (host-only game-speed/pause authority, runs on BOTH clients):
     //  * detect a LOCAL user speed click (current state != what WE last applied)
     //    and turn it into a request (pause = speed 0);
     //  * join: send PKT_SPEED_REQ (change-gated + 3 s safety resend) and apply
-    //    any received PKT_SPEED_SET;
-    //  * host: consume its own request locally, drain peer requests, arbitrate
-    //    effective = min(requests) capped at 1x while either player squad is in
-    //    combat (own flag from ownHands_+readCombat, peer flag from its REQ),
-    //    apply locally and broadcast PKT_SPEED_SET on change (+ safety resend).
+    //    any received PKT_SPEED_SET; a local speed/pause action is DENIED (flag
+    //    speedDeniedEdge_ for the toast) and reverted by the enforcement below;
+    //  * host: consume its OWN request locally, arbitrate effective from the
+    //    host's request alone (SpeedGate::effectiveHostSpeed) capped at 1x while
+    //    either player squad is in combat (own flag from ownHands_+readCombat,
+    //    peer combat bit from its REQ), apply locally and broadcast
+    //    PKT_SPEED_SET on change (+ safety resend). The join's REQUEST no longer
+    //    lowers the effective (was min(host, join) consensus).
     void syncSpeed(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerId, bool isHost);
+
+    // Host-only authority feedback: true once after a JOIN tried to change
+    // speed/pause (denied + reverted); clears on read. Plugin polls this to pop
+    // the "only the host can change game speed" toast. Always false on the host.
+    bool consumeSpeedDenied() { bool e = speedDeniedEdge_; speedDeniedEdge_ = false; return e; }
 
     // BEFORE engine, AFTER syncSpeed (protocol 25 game-clock sync):
     //  * host: broadcast the absolute in-game clock (PKT_TIME, ~1 Hz);
@@ -757,6 +822,15 @@ private:
         // self-heal; this guard re-asserts setChainedMode independently so a peer
         // PC's local lockpick can't leave the owner's prisoner unlocked on the peer.
         unsigned long chainHealTick;
+        // Spike 58 (kind-conflict anchor): the furniture kind last vouched for
+        // this body by a RELIABLE edge (RECV ENTER, or the host's own
+        // PEER-ENTER authoring; 0 = none, cleared on a reliable EXIT / the
+        // debounced HEAL EXIT). While the lossy stream says chained
+        // (streamKind=3) but an edge vouches the local cage/bed (1/2), the
+        // cage/bed stays the transform anchor and the shackle is re-asserted
+        // EQUIP-only (chainAnchorStep) - the kind=3 heal must not break an
+        // edge-vouched cage every FURN_HEAL_MS (the 75-885 u re-seat teleport).
+        int           furnEdgeKind;
         // Stealth sync (protocol 20):
         unsigned long sneakTick;      // last setStealthMode apply (mode-flap throttle)
         // Velocity-aware snap gate (2026-07-11): slow-decaying peak of the
@@ -796,7 +870,7 @@ private:
                    trusted(false), agreeStreak(0),
                    carryHealTick(0), carryNoSeeTick(0),
                    furnHealTick(0), furnNoSeeTick(0), furnPeerTick(0),
-                   haveChainOwner(false), chainHealTick(0),
+                   haveChainOwner(false), chainHealTick(0), furnEdgeKind(0),
                    sneakTick(0), velPeak(0.0f), moveSeenMs(0), wasMoving(false),
                    zeroF(0), activeF(0), midSeenMs(0) {
             chainOwner[0] = chainOwner[1] = chainOwner[2] = chainOwner[3] = chainOwner[4] = 0;
@@ -825,6 +899,11 @@ private:
     void logDriveTelemetry(unsigned long now);
     //   * age out long-stale targets_ entries (reliable-event latches preserved).
     void ageOutStaleTargets(unsigned long now);
+    //   * owner-side carried self-heal (SYNC_GAPS 16b): unlike the phases above
+    //     this one also reads LOCAL carry state, so it takes gw + the captured
+    //     squad rather than only Replicator members + the tick clock.
+    void healOwnCarried(GameWorld* gw, const EntityState* oracleSquad,
+                        unsigned int oracleSquadN, unsigned long now);
 
     std::map<Key, Driven> targets_;
     // Host side: last bodyState we published per owned entity (+ when it was last
@@ -981,6 +1060,12 @@ private:
     // (5 s re-author window) PEER-ENTER must not re-jail a body its owner
     // just freed - the exit-vs-reauthor race guard.
     std::map<Key, unsigned long> ownFurnExit_;
+    // Owner-side carried self-heal (SYNC_GAPS 16b): per-own-hand debounce
+    // anchor - first tick an OWNED body's local isBeingCarried had NO live
+    // streamed TASK_CARRY_BODY claim backing it (0 = disarmed). Stepped by
+    // coop::carriedHealStep in applyTargets; entries erased once the body is
+    // no longer carried, so the map stays squad-sized.
+    std::map<Key, unsigned long> ownCarriedNoSee_;
     InterpConfig          cfg_;
     float                 catchupK_;  // walk-drive gap-proportional speed gain
     float                 snapDist_;  // moving-body hard-snap distance floor (u)
@@ -1321,13 +1406,11 @@ private:
     // RESEND_MS names to these fields, so behavior is unchanged - this is the one
     // place their cadence now lives. See SyncTuning.h.
     SyncTuning tuning_;
-    // Protocol 22: per OWNED tab rank, the last SENT wallet value + send time
-    // (change gate + safety resend). A settled economy is silent.
-    struct MoneyPub {
-        int lastSent; unsigned long lastSendMs;
-        MoneyPub() : lastSent(-1), lastSendMs(0) {}
-    };
-    std::map<unsigned int, MoneyPub> moneyPub_;
+    // Protocol 22b: the SHARED player-faction wallet reconciled by delta (see
+    // MoneyReconcile.h). One baseline for the whole session - the wallet is
+    // per-faction, not per-tab. seeded on the first sample, advanced on every
+    // local delta published and every remote delta applied.
+    MoneyState factionMoney_;
     bool moneySync_;
     // Protocol 24 faction-relation sync state, per faction sid.
     // known      = our current baseline (seeded on first sight, updated on every
@@ -1335,11 +1418,14 @@ private:
     //              echo guard: an applied row is never re-detected as local).
     // lastSendVal/lastSendMs = change gate + safety resend (rows never sent
     //              never resend, so a settled diplomacy is silent).
-    // seqSeen    = newest per-sender seq applied (stale-row guard).
+    // seqSeen    = newest seq applied PER SENDER (keyed by the packet's
+    //              ownerId; both clients publish this symmetric channel with
+    //              INDEPENDENT counters, so one shared counter would let a
+    //              faster sender starve the slower one's rows as "stale").
     struct FacRow {
         float known; float lastSendVal; unsigned long lastSendMs;
-        u32 seqSeen; bool seeded;
-        FacRow() : known(0), lastSendVal(0), lastSendMs(0), seqSeen(0), seeded(false) {}
+        std::map<u32, u32> seqSeen; bool seeded;
+        FacRow() : known(0), lastSendVal(0), lastSendMs(0), seeded(false) {}
     };
     std::map<std::string, FacRow> facRows_;
     u32           facSeqOut_;
@@ -1348,12 +1434,13 @@ private:
     // Protocol 26 door-state sync, per door hand (the faction shape: known =
     // baseline, updated on every local change sent AND every received row
     // applied - the echo guard; lastSendMs = change gate + safety resend;
-    // seqSeen = stale-row guard).
+    // seqSeen = per-sender stale-row guard, keyed by the packet's ownerId -
+    // both clients publish this symmetric channel with independent counters).
     struct DoorRow {
         int knownOpen; int knownLocked; unsigned long lastSendMs;
-        u32 seqSeen; bool seeded;
+        std::map<u32, u32> seqSeen; bool seeded;
         DoorRow() : knownOpen(-1), knownLocked(-1), lastSendMs(0),
-                    seqSeen(0), seeded(false) {}
+                    seeded(false) {}
     };
     std::map<Key, DoorRow> doorRows_;
     u32           doorSeqOut_;
@@ -1400,12 +1487,13 @@ private:
     unsigned long buildSampleMs_;
     bool          buildSync_;
     // Protocol 28 placed-door rows, keyed by (placer building key, door
-    // index) - the protocol-26 DoorRow shape on the translated identity.
+    // index) - the protocol-26 DoorRow shape on the translated identity
+    // (seqSeen is per-sender for the same reason: both sides publish).
     struct BdoorRow {
         int knownOpen; int knownLocked; unsigned long lastSendMs;
-        u32 seqSeen; bool seeded;
+        std::map<u32, u32> seqSeen; bool seeded;
         BdoorRow() : knownOpen(-1), knownLocked(-1), lastSendMs(0),
-                     seqSeen(0), seeded(false) {}
+                     seeded(false) {}
     };
     std::map<std::pair<Key, int>, BdoorRow> bdoorRows_;
     u32           bdoorSeqOut_;
@@ -1433,10 +1521,23 @@ private:
     unsigned long prodSampleMs_;
     bool          prodSync_;
     // Protocol 38 known-research rows, keyed by the RESEARCH stringID (the
-    // cross-client-stable wire identity, spike 401). HOST: sent/lastSendMs =
-    // first-sight send + safety resend. JOIN: seqSeen = stale-row guard,
-    // applied = the local startResearch landed (isKnown flipped) so resends
-    // stop re-applying.
+    // cross-client-stable wire identity, spike 401). Research now runs as a
+    // grow-only CRDT union (kCh[] hostAuth=false): BOTH sides publish their
+    // known set AND apply what they receive, so a JOIN-side unlock reaches the
+    // host too (this is the fix/crafting-research-join-authority change; the
+    // old model was one-directional host->join). Per row: sent/lastSendMs =
+    // first-sight send + safety resend (our PUBLISH half); seqSeen =
+    // stale/dup-row guard, applied = the local startResearch landed (isKnown
+    // flipped) so resends stop re-applying (our APPLY half). Convergence is by
+    // idempotence - knowing a sid can never be "un-known", so there is no
+    // arbitration and message order does not matter.
+    // FUTURE (4-player): the SCALAR seqSeen guard is safe TODAY because a row's
+    // content is independent of the emitter (any sender asserting sid X means
+    // the exact same thing). With 3+ distinct emitters interleaving their own
+    // seq counters on one sid, this single per-row counter must be re-audited:
+    // a high seq from one peer can shadow a still-unapplied resend from
+    // another - harmless here ONLY because 'applied' latches on the first
+    // successful start, but a per-sender seqSeen would be the clean fix.
     struct ResearchRow {
         unsigned long lastSendMs;
         u32  seqSeen;
@@ -1454,6 +1555,30 @@ private:
     u32           weatherSeqOut_;   // host outgoing per-sender seq
     u32           weatherSeqSeen_;  // join last-accepted seq (stale-row guard)
     bool          weatherRoleSet_;  // engine detour role latched from ctx.isHost
+    // Protocol 45 bounty/crime rows, keyed by (owning-character hand, faction
+    // sid) - BountyManager is inline per-Character, so the key is per-character,
+    // NOT per-squad. HOST (the only publisher): known = the shared-save baseline
+    // (seeded silently on first sight, updated on every row we send - so a
+    // resend is not re-detected); lastSendMs = change gate + safety resend.
+    // CLIENT: seqSeen = stale-row guard (the client never publishes, so the send
+    // fields stay idle). The value triple mirrors the wire row.
+    struct BountyRow {
+        int knownAmount; u32 knownCrimes; int knownClaimed;
+        unsigned long lastSendMs;
+        u32 seqSeen; bool seeded;
+        BountyRow() : knownAmount(0), knownCrimes(0), knownClaimed(0),
+                      lastSendMs(0), seqSeen(0), seeded(false) {}
+    };
+    std::map<std::pair<Key, std::string>, BountyRow> bountyRows_;
+    u32           bountySeqOut_;
+    unsigned long bountySampleMs_;
+    bool          bountySync_;
+    // False until the first publishBounties sample has seeded every load-time
+    // bounty row as the shared-save baseline. After that, a newly-seen (char,
+    // faction) key is a genuine mid-session appearance (a fresh crime), streamed
+    // from an implicit zero instead of silently re-seeded (a bounty ROW can go
+    // from not-existing to existing, unlike the always-present faction/door rows).
+    bool          bountyBaseline_;
     // Protocol 23 recruitment sync state.
     bool recruitSync_;
     // Ownership PINS (protocols 23 + 35): per-hand overrides layered on the
@@ -1561,9 +1686,31 @@ private:
     // LOC = local-sim copy that exists in the host census. No-op (single env
     // check) unless the flag is set. Labels are created once per body and
     // re-captioned only on state change.
-    struct DebugMarker { void* label; int color; };
+    struct DebugMarker { void* label; int color; std::string caption; };
     std::map<Character*, DebugMarker> debugMarkers_;
+    // Remote player's display name (Steam persona), pushed in via setRemoteName.
+    // Used to caption DRV (host-driven = remote-controlled) bodies with WHOSE
+    // unit it is; empty falls back to the legacy "DRV <charName>" caption.
+    std::string remoteName_;
     void debugMark(Character* c, int colorId, const char* tag);
+
+    // ---- Normal-play remote-player nametag ----------------------------------
+    // A DEDICATED name-label layer, separate from the debugMarkers_ diagnostic
+    // overlay: one floating label per PEER-owned driven body (the other player's
+    // squad), captioned with their Steam persona name. Kept apart from the debug
+    // markers because those re-caption the same label with life-state names
+    // (HI/MID/PARKED) every tick, which would clobber the persona name. Always on
+    // in normal play (gated by showNametag_, not KENSHICOOP_DEBUG_MARKERS).
+    struct NametagMarker { void* label; std::string caption; };
+    std::map<Character*, NametagMarker> nametagMarkers_;
+    bool showNametag_;              // F2/config toggle; true = draw name labels
+    // Create/update (or, when off/non-squad, remove) the name label for body c.
+    // 'isSquad' = c is a player-faction (peer's own) unit, so it earns a name;
+    // world NPCs the host merely drives do not.
+    void nametagMark(Character* c, bool isSquad);
+    // Drop name labels whose Character* wasn't vouched live this pass (mirrors
+    // pruneDebugMarkers - same UAF-safe GC against freed/despawned bodies).
+    void pruneNametags(const std::set<Character*>& live);
     // Lifetime guard (2026-07-11 join crash): the map is keyed by raw
     // Character* the engine can free (and REUSE for a new body, silently
     // stealing the old label). enforceHostAuthority prunes entries whose
@@ -1616,6 +1763,10 @@ private:
     unsigned long speedLastSendMs_;    // last REQ (join) / SET (host) send, safety resend
     unsigned long speedCombatSampleMs_;// last own-combat sample time
     unsigned long speedCombatHoldMs_;  // last time own-squad combat read TRUE (cap hysteresis)
+    // Host-only authority: set true when a JOIN tried to change speed/pause this
+    // tick (its input is denied and reverted). Plugin consumes the edge to pop
+    // the "only the host can change game speed" toast. Always false on the host.
+    bool          speedDeniedEdge_;
 
     // Protocol 25 game-clock sync state. timeSlew_ is the join's correction
     // multiplier (1.0 = no correction); the speed layer applies effective *

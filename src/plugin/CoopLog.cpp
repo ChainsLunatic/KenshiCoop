@@ -17,6 +17,12 @@ CRITICAL_SECTION g_cs;
 bool             g_init = false;
 char             g_tag[16] = { 0 };
 volatile long    g_fakeSkewMs = 0;
+// Timestamp of the last fflush, in the wallClockMs() frame. The flush cadence
+// is throttled to ~250 ms instead of once per line so the net thread (which
+// shares g_cs) no longer eats a synchronous disk flush on every log call. Any
+// close/error teardown path still forces an immediate flush (see logClose),
+// preserving the "survives a hard kill" guarantee the header documents.
+unsigned long    g_lastFlushMs = 0;
 
 void writeLine(const char* level, const char* msg) {
     if (!g_init) return;
@@ -32,7 +38,14 @@ void writeLine(const char* level, const char* msg) {
         std::fprintf(g_fp, "[%02lu:%02lu:%02lu.%03lu] [%s] %s: %s\n",
                      hh, mm, ss, mmm,
                      g_tag, level, msg ? msg : "");
-        std::fflush(g_fp);
+        // Periodic flush (~250 ms) rather than per-line. wallClockMs() wraps at
+        // 24 h, so use the wrapped delta and also flush if the clock went
+        // backwards (wrap / skew change) to avoid a 24 h flush gap.
+        unsigned long delta = ms - g_lastFlushMs;
+        if (ms < g_lastFlushMs || delta >= 250ul) {
+            std::fflush(g_fp);
+            g_lastFlushMs = ms;
+        }
     }
     LeaveCriticalSection(&g_cs);
 }

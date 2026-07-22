@@ -28,13 +28,26 @@
 #include "../plugin/sync/Interp.h"
 #include "../plugin/core/OwnRanks.h"
 #include "../plugin/core/SteamId.h"
+#include "../plugin/core/Nametag.h"
+#include "../plugin/core/Config.h" // saveLastPeer/loadLastPeer round-trip (compiled from Config.cpp)
 #include "../plugin/core/WorkPose.h"
+#include "../plugin/core/FreeCamMath.h" // cámara libre: matemática pura de movimiento/vista
 #include "../plugin/core/DeathLatch.h"
 #include "../plugin/core/Inbound.h" // Phase 0 queue-lifecycle fixes (header-only)
 #include "../plugin/game/EngineFaults.h" // Phase 5c: fault throttle (pure inline)
 #include "../plugin/game/EngineCaps.h"   // Phase 5d: capability registry (pure inline)
+#include "../plugin/game/ToastTimer.h"   // ephemeral connect/disconnect toast clock
 #include "../plugin/sync/ChangeGate.h"   // Phase 6: change-gated send/accept policy
 #include "../plugin/sync/SaveXfer.h"     // Part A: real save-transfer receiver end-to-end
+#include "../plugin/core/JailAnchor.h" // chainAnchorStep (captive kind-conflict anchor, spike 58)
+#include "../plugin/core/MoneyReconcile.h" // Phase 6/22b: shared-wallet delta reconcile
+#include "../plugin/core/StatusAutohide.h" // status-banner auto-hide policy (pure inline)
+#include "../plugin/core/StaleGuard.h"   // per-sender stale-row guard (symmetric channels)
+#include "../plugin/core/CarriedHeal.h"  // owner-side carried self-heal (16b)
+#include "../plugin/core/ProdAuthority.h" // autoridad por-objeto de crafteo (protocolo 33)
+#include "../plugin/sync/DriveTaper.h"    // walk-drive deceleration taper (pure inline)
+#include "../plugin/sync/LoadGate.h"     // join LOAD_GO evaluate-vs-load policy
+#include "../plugin/sync/SpeedGate.h"    // host-only speed/pause authority policy
 
 #include <set>
 #include <string>
@@ -43,16 +56,14 @@
 
 using namespace coop;
 
-// SaveXfer.cpp logs through coop::logLine/logErrLine; CoopLog.cpp is NOT part of
-// this CRT-only build, so provide inert definitions to satisfy the linker (the
-// round-trip test only cares about the staged/committed bytes, not the log).
-namespace coop {
-    void logLine(const char*) {}
-    void logErrLine(const char*) {}
-}
+// Non-static: savexfer_test.cpp folds its checks into the same run total and
+// provides the inert coop::logLine/logErrLine stubs SaveXfer.cpp links against
+// (CoopLog.cpp is not part of this CRT-only build).
+int g_failed = 0;
+int g_total  = 0;
 
-static int g_failed = 0;
-static int g_total  = 0;
+// SaveXfer receiver data-safety coverage (src/prototest/savexfer_test.cpp).
+void testSaveXfer();
 
 #define CHECK(name, cond) do { \
     ++g_total; \
@@ -116,6 +127,7 @@ static void testSizes() {
     CHECK_EQ("sizeof(ResearchPacket)",          sizeof(ResearchPacket),          57); // v37: research
     CHECK_EQ("sizeof(WeatherPacket)",           sizeof(WeatherPacket),           113); // v46: weather (v2: +seasonSid +duration)
     CHECK_EQ("sizeof(CamHintPacket)",           sizeof(CamHintPacket),           17); // v43: camera hint
+    CHECK_EQ("sizeof(BountyPacket)",            sizeof(BountyPacket),            86); // v45: bounty/crime row
     // A full entity batch must fit one ~1400 B datagram (NetLink chunking cap).
     CHECK("entity batch fits datagram",
           sizeof(EntityBatchHeader) + ENTITY_BATCH_MAX * sizeof(EntityState) <= 1428);
@@ -221,7 +233,7 @@ static void testSizes() {
     CHECK_EQ("EVT_SQUAD_MOVE id", (int)EVT_SQUAD_MOVE, 11);
     CHECK("EVT_SQUAD_MOVE distinct", EVT_SQUAD_MOVE != EVT_RECRUIT &&
           EVT_SQUAD_MOVE != EVT_NONE && EVT_SQUAD_MOVE != EVT_EXIT_FURNITURE);
-    CHECK_EQ("PROTOCOL_VERSION (v46: character name + animal age + weather sync)", (int)PROTOCOL_VERSION, 46);
+    CHECK_EQ("PROTOCOL_VERSION (v46: name + animal age + weather sync; local zeroit789 merge adds bounty at PKT_BOUNTY=44, version kept 46)", (int)PROTOCOL_VERSION, 46);
 }
 
 // ---- 2. readPacket / packetType round-trips -----------------------------------
@@ -742,6 +754,16 @@ static EntityState entAt(float x) {
     return e;
 }
 
+// Same base body, but with an explicit locomotion state (the fields the
+// foot-slide fix time-aligns): moving flag, speed, and world-space motion.
+static EntityState entLoco(float x, unsigned char moving, float speed) {
+    EntityState e = entAt(x);
+    e.cMoving = moving;
+    e.cSpeed  = speed;
+    e.cMotionX = speed; e.cMotionY = 0.0f; e.cMotionZ = 0.0f;
+    return e;
+}
+
 static void testInterp() {
     std::printf("== interpolation buffer (Interp.cpp) ==\n");
     InterpConfig cfg; // min 50 / max 200 delay, extrap 250, snap 50u, stale 2000
@@ -838,6 +860,39 @@ static void testInterp() {
         EntityState out;
         bool ok = it.sample(1030, cfg, &out);
         CHECK("identity+state passthrough", ok && out.bodyState == BODY_DOWN && out.cMoving == 1 && out.task == 42 && out.hIndex == 1);
+    }
+
+    // Time-aligned locomotion (foot-slide fix, commit 0191d73): the moving FLAG
+    // and speed sample() returns must match the RENDER-DELAY position, not the
+    // newest snapshot. Feed a body walking x=0->3 over 1000..1150ms that is
+    // STOPPED at the newest snapshot. With a one-interval (50ms) render delay the
+    // buffer is still gliding through the last MOVING segment while the newest
+    // snapshot already reads idle - the exact on-stop foot-slide case. Loco must
+    // come from the segment START (still moving), not the newest (already idle).
+    // These CHECKs go RED if commit 0191d73 is reverted (loco falls back to the
+    // newest snapshot): mid.cMoving reads 0 and mid.cSpeed reads 0.
+    {
+        EntityInterp it;
+        it.push(entLoco(0.0f, 1, 10.0f), 1000); // moving
+        it.push(entLoco(1.0f, 1, 10.0f), 1050); // moving
+        it.push(entLoco(2.0f, 1, 10.0f), 1100); // moving: START of the stopping segment
+        it.push(entLoco(3.0f, 0,  0.0f), 1150); // STOPPED (newest): flag idle, speed 0
+
+        // nowMs=1175 -> renderTime=1125: mid of the [1100,1150] segment. Position
+        // still gliding (x~2.5); read s0 (moving,10) lerped toward s1 (idle,0).
+        EntityState mid;
+        bool okMid = it.sample(1175, cfg, &mid);
+        CHECK("stopping LERP still reads moving", okMid && mid.cMoving == 1);
+        CHECK("stopping LERP speed interpolated (not the stopped newest)",
+              okMid && mid.cSpeed > 4.9f && mid.cSpeed < 5.1f);
+        CHECK("stopping LERP position still gliding", okMid && mid.x > 2.4f && mid.x < 2.6f);
+
+        // nowMs=1225 -> renderTime=1175 >= newest.t: render has crossed onto the
+        // already-stopped newest, so the flag now correctly reads idle.
+        EntityState done;
+        bool okDone = it.sample(1225, cfg, &done);
+        CHECK("crossed onto stopped newest reads idle", okDone && done.cMoving == 0);
+        CHECK("crossed onto stopped newest speed zero", okDone && done.cSpeed < 0.1f);
     }
 }
 
@@ -947,6 +1002,84 @@ static void testSteamIdParse() {
           !coop::parseSteamId64("765611980000000000", id) && id == 123ull);
     CHECK("17 digits, wrong prefix rejected",
           !coop::parseSteamId64("12345678901234567", id) && id == 123ull);
+}
+
+// ---- 7b. Remote-player nametag caption (Nametag.h) ------------------------------
+// Guards the DRV body nametag: the caption shows the remote player's Steam persona
+// name when known, and falls back honestly ("DRV <charName>", then "[Remote Player]")
+// when Steam can't give a name (non-friend not yet resolved, LAN/UDP, API down).
+// Steam returns the literal "[unknown]" for unresolved users, which must NOT be
+// shown as a name. Names are trimmed and capped to the 63-char marker buffer.
+
+static void testNametag() {
+    std::printf("== remote-player nametag caption (Nametag.h) ==\n");
+
+    // A real persona name wins over the fallback.
+    CHECK("persona name used when valid",
+          coop::remoteNametagCaption("Zero", "DRV Beep") == "Zero");
+    // Steam's "[unknown]" placeholder is rejected -> fallback used.
+    CHECK("[unknown] rejected -> fallback",
+          coop::remoteNametagCaption("[unknown]", "DRV Beep") == "DRV Beep");
+    // Null / empty persona -> fallback used.
+    CHECK("null persona -> fallback",
+          coop::remoteNametagCaption(0, "DRV Beep") == "DRV Beep");
+    CHECK("empty persona -> fallback",
+          coop::remoteNametagCaption("", "DRV Beep") == "DRV Beep");
+    // Whitespace-only persona is not a name -> fallback used.
+    CHECK("blank persona -> fallback",
+          coop::remoteNametagCaption("   ", "DRV Beep") == "DRV Beep");
+    // No persona and no fallback -> generic label (never empty).
+    CHECK("no persona + no fallback -> generic",
+          coop::remoteNametagCaption(0, 0) == "[Remote Player]");
+    CHECK("no persona + empty fallback -> generic",
+          coop::remoteNametagCaption("", "") == "[Remote Player]");
+    // Persona names are trimmed at the ends (spaces a friend may have around it).
+    CHECK("persona trimmed",
+          coop::remoteNametagCaption("  Zero  ", "DRV Beep") == "Zero");
+    // Names longer than the marker buffer are capped to 63 chars.
+    {
+        std::string longName(80, 'x');
+        std::string out = coop::remoteNametagCaption(longName.c_str(), "DRV Beep");
+        CHECK("long persona capped to 63", out.size() == 63);
+    }
+    // A persona name containing internal spaces is preserved verbatim.
+    CHECK("internal spaces preserved",
+          coop::remoteNametagCaption("Dark Zero", "DRV Beep") == "Dark Zero");
+}
+
+// ---- 7b. Last-peer persistence (Config.cpp saveLastPeer/loadLastPeer) ------------
+// Guards the F2-panel convenience persistence: a valid pasted friend SteamID is
+// written to coop_last_peer.txt so the next launch pre-fills it (loadConfig folds
+// it into steamPeer when neither env nor coop_config.json set one). The store must
+// round-trip, re-validate on read (a junk file yields 0, never a bogus peer), and
+// treat id 0 as "nothing to remember". No game deps - path resolves next to the
+// module, which for this test exe is the cwd (GetModuleHandleA("KenshiCoop.dll")
+// is null here), so the file lands in the working dir and is cleaned up after.
+static void testLastPeerPersist() {
+    std::printf("== last-peer persistence (Config.cpp) ==\n");
+    std::remove("coop_last_peer.txt"); // start from a known-empty state
+
+    CHECK("missing file -> 0", coop::loadLastPeer() == 0ull);
+
+    coop::saveLastPeer(76561198012345678ull);
+    CHECK("saved id round-trips", coop::loadLastPeer() == 76561198012345678ull);
+
+    // A later paste overwrites the remembered id (truncating write, not appending).
+    coop::saveLastPeer(76561198099999999ull);
+    CHECK("second save overwrites", coop::loadLastPeer() == 76561198099999999ull);
+
+    // id 0 is a no-op: it must NOT wipe the remembered peer.
+    coop::saveLastPeer(0ull);
+    CHECK("save(0) is a no-op", coop::loadLastPeer() == 76561198099999999ull);
+
+    // A corrupted/edited file re-validates to 0 (parseSteamId64 gate on read).
+    {
+        std::FILE* f = std::fopen("coop_last_peer.txt", "wb");
+        if (f) { std::fputs("not-a-steam-id", f); std::fclose(f); }
+        CHECK("corrupted file -> 0", coop::loadLastPeer() == 0ull);
+    }
+
+    std::remove("coop_last_peer.txt"); // clean up the test artifact
 }
 
 // ---- 8. Pose-fixture acceptance (WorkPose.h) ------------------------------------
@@ -1526,6 +1659,663 @@ static void testChangeGate() {
           gateShouldSend(true, 80001, 80000, 0, 10000, false));
 }
 
+// ---- 12. Captive kind-conflict anchor (JailAnchor.h) ---------------------------
+// Guards the spike-58 fix: a chained+caged prisoner streams CHAINED-only in the
+// lossy batch while the reliable edges vouch the cage. The step must (a) HOLD an
+// edge-vouched cage/bed (no break, no re-chain transform - the 75-885 u re-seat
+// teleport), (b) still RECHAIN a stale/unvouched local attach (the Flashbox
+// case), and (c) stay quiet when the stream is not chained or the copy already
+// is (no invented heals).
+
+static void testJailAnchor() {
+    std::printf("== captive kind-conflict anchor (JailAnchor.h) ==\n");
+
+    // Not a chained stream: never this policy's business (kind 1/2 heals and
+    // the no-furniture drive handle those).
+    CHECK("cage stream -> NONE",    chainAnchorStep(2, 2, 2) == CHAIN_ANCHOR_NONE);
+    CHECK("bed stream -> NONE",     chainAnchorStep(1, 1, 1) == CHAIN_ANCHOR_NONE);
+    CHECK("no stream kind -> NONE", chainAnchorStep(0, 2, 2) == CHAIN_ANCHOR_NONE);
+
+    // Already chained locally: in sync, nothing to heal.
+    CHECK("chained+chained -> NONE",        chainAnchorStep(3, 3, 0) == CHAIN_ANCHOR_NONE);
+    CHECK("chained+chained vouched -> NONE", chainAnchorStep(3, 3, 3) == CHAIN_ANCHOR_NONE);
+
+    // The bug: CHAINED-only continuous bit against an edge-vouched cage/bed.
+    // The anchor wins - never break it over the disagreement.
+    CHECK("vouched cage vs chained -> HOLD", chainAnchorStep(3, 2, 2) == CHAIN_ANCHOR_HOLD);
+    CHECK("vouched bed vs chained -> HOLD",  chainAnchorStep(3, 1, 1) == CHAIN_ANCHOR_HOLD);
+
+    // An UNVOUCHED local cage is the Flashbox stale attach: break + re-chain.
+    CHECK("unvouched cage -> RECHAIN",       chainAnchorStep(3, 2, 0) == CHAIN_ANCHOR_RECHAIN);
+    CHECK("unvouched bed -> RECHAIN",        chainAnchorStep(3, 1, 0) == CHAIN_ANCHOR_RECHAIN);
+    // Vouch/local mismatch is no vouch at all (edge moved on, copy did not).
+    CHECK("bed vouch, cage local -> RECHAIN", chainAnchorStep(3, 2, 1) == CHAIN_ANCHOR_RECHAIN);
+    CHECK("chain vouch, cage local -> RECHAIN", chainAnchorStep(3, 2, 3) == CHAIN_ANCHOR_RECHAIN);
+
+    // No local furniture at all: the plain re-chain heal (lost/late ENTER).
+    CHECK("no furniture -> RECHAIN",          chainAnchorStep(3, 0, 0) == CHAIN_ANCHOR_RECHAIN);
+    CHECK("no furniture, stale vouch -> RECHAIN", chainAnchorStep(3, 0, 2) == CHAIN_ANCHOR_RECHAIN);
+}
+
+// ---- 11. Shared-wallet delta reconciliation (MoneyReconcile.h) ------------------
+// Guards the money-sync fix (2026-07-20): the player's real wallet is ONE shared
+// per-faction pool, so the channel replicates DELTAS and the peer ADDS them.
+// This locks: seed-is-silent, idle-is-silent, local delta detection + baseline
+// advance, remote delta apply + baseline advance (echo-guard), and the decisive
+// property - two CONCURRENT spends converge to the same total on both clients
+// (which absolute-value sync would corrupt).
+static void testMoneyReconcile() {
+    std::printf("== shared-wallet delta reconciliation (MoneyReconcile.h) ==\n");
+
+    // First sample seeds silently (no spurious delta at connect).
+    MoneyState s; int d = 12345;
+    CHECK("first sample seeds (no send)", !moneyLocalDelta(s, 1000, &d));
+    CHECK("seed sets baseline",           s.known == 1000);
+
+    // No change -> nothing to publish.
+    CHECK("idle wallet is silent", !moneyLocalDelta(s, 1000, &d));
+
+    // A local spend publishes a negative delta and advances the baseline.
+    CHECK("local spend detected",  moneyLocalDelta(s, 750, &d));
+    CHECK_EQ("spend delta = -250", (long long)d + 1000, 750); // d == -250
+    CHECK("baseline followed spend", s.known == 750);
+    CHECK("same wallet now idle",  !moneyLocalDelta(s, 750, &d));
+
+    // A remote delta is applied by ADDING it, and the baseline advances so the
+    // next local check does NOT echo it back.
+    int now = moneyApplyDelta(s, 750, -100); // peer spent 100
+    CHECK_EQ("apply subtracts",    now, 650);
+    CHECK("baseline followed apply", s.known == 650);
+    CHECK("applied delta not echoed", !moneyLocalDelta(s, 650, &d));
+
+    // The crux: two concurrent spends from a shared 1000 pool converge to 650 on
+    // BOTH clients (absolute-value sync would land one side on 750, the other on
+    // 900, losing money). A: local -250, then receives B's -100. B: local -100,
+    // then receives A's -250. Both must end at 650 with matching baselines.
+    MoneyState a; MoneyState b;
+    int da = 0, db = 0;
+    moneyLocalDelta(a, 1000, &da); // seed A
+    moneyLocalDelta(b, 1000, &db); // seed B
+    CHECK("A publishes its spend", moneyLocalDelta(a, 750, &da));  // da = -250
+    CHECK("B publishes its spend", moneyLocalDelta(b, 900, &db));  // db = -100
+    int aFinal = moneyApplyDelta(a, 750, db); // A applies B's -100
+    int bFinal = moneyApplyDelta(b, 900, da); // B applies A's -250
+    CHECK_EQ("A converges to 650", aFinal, 650);
+    CHECK_EQ("B converges to 650", bFinal, 650);
+    CHECK("A/B baselines agree",   a.known == b.known);
+    CHECK("baselines are 650",     a.known == 650);
+
+    // THE CLAMP FIX (2026-07-21): a remote delta that would drive the wallet
+    // negative is clamped to 0, and the baseline MUST follow the clamped value
+    // (0), NOT the theoretical delta. Otherwise 'known' goes negative, diverges
+    // from the real wallet, and the NEXT moneyLocalDelta reads cur(0)-known(<0)
+    // as a positive spurious delta - money printed from nothing, permanent desync.
+    //
+    // Repro: shared pool at 1000. This client (join) spends 800 locally (wallet
+    // 1000->200, baseline follows to 200 after publishing -800). Meanwhile the
+    // host spent 1000; that -1000 delta arrives here: 200 + (-1000) = -800 ->
+    // clamp to 0. Pre-fix, known landed at -800 (200 + (-1000)); post-fix it must
+    // land at 0 (the value actually written to the wallet).
+    {
+        MoneyState j; int jd = 0;
+        moneyLocalDelta(j, 1000, &jd);                 // seed at the shared 1000
+        CHECK("clamp: local spend of 800 detected", moneyLocalDelta(j, 200, &jd));
+        CHECK_EQ("clamp: local spend delta = -800", (long long)jd + 1000, 200); // jd == -800
+        CHECK("clamp: baseline followed local spend", j.known == 200);
+
+        // Host's -1000 arrives; 200 + (-1000) = -800 -> clamp to 0.
+        int applied = moneyApplyDelta(j, 200, -1000);
+        CHECK_EQ("clamp: wallet clamped to 0", applied, 0);
+        // THE ASSERTION THAT FAILS PRE-FIX: known must equal the real wallet (0),
+        // not the un-clamped theoretical baseline (-800).
+        CHECK("clamp: baseline follows clamped wallet (0), not theoretical (-800)",
+              j.known == 0);
+
+        // The decisive property: a subsequent publish must NOT fabricate a delta.
+        // Pre-fix, moneyLocalDelta(cur=0, known=-800) returned true with a +800
+        // spurious delta (money from nothing). Post-fix, cur==known==0 -> silent.
+        int spurious = 0;
+        CHECK("clamp: next publish emits NO phantom delta",
+              !moneyLocalDelta(j, 0, &spurious));
+    }
+}
+
+// ---- 13. Persistent status-banner auto-hide (StatusAutohide.h) ------------------
+// Guards the QoL auto-hide (2026-07-20): the green "Connected - peer joined" banner
+// floats over the leader for the whole session. Once the session has held the
+// connected/green state for a sustained window it auto-hides so it stops cluttering
+// the screen; leaving green (disconnect / peer leave / reconnect) reappears it
+// immediately and re-arms the timer. Same unsigned-wrap-safe shape as poseClearElapsed.
+static void testStatusAutohide() {
+    std::printf("== status banner auto-hide (StatusAutohide.h) ==\n");
+    const unsigned long ms = STATUS_AUTOHIDE_MS; // 10000 (default)
+
+    // Not green (stableSince == 0): never auto-hidden, banner keeps showing.
+    CHECK("not green never auto-hides",  !statusAutohideElapsed(0, 999999, ms));
+
+    // Green but still inside the window: banner holds (no premature hide).
+    CHECK("green 0 ms holds",            !statusAutohideElapsed(5000, 5000,  ms));
+    CHECK("green 9999 ms holds",         !statusAutohideElapsed(5000, 14999, ms));
+
+    // Green at/after the window: banner auto-hides.
+    CHECK("green 10000 ms hides",         statusAutohideElapsed(5000, 15000, ms));
+    CHECK("green 30 s hides",             statusAutohideElapsed(5000, 35000, ms));
+
+    // autohideMs == 0 disables the feature (banner never auto-hides).
+    CHECK("disabled never hides",        !statusAutohideElapsed(5000, 999999, 0));
+
+    // Unsigned GetTickCount wrap across the window still elapses correctly: the green
+    // streak started 100 ms before the 2^32 rollover; 'now' is written post-wrapped.
+    const unsigned long nearMax  = 0xFFFFFFFFul - 100; // green began 100 ms before wrap
+    const unsigned long preWrap  = nearMax + 50;       // 50 ms later, pre-wrap (holds)
+    const unsigned long postWrap = 9899UL;             // (nearMax + 10000) mod 2^32 = 10000 ms later
+    CHECK("wrap: 50 ms holds",           !statusAutohideElapsed(nearMax, preWrap,  ms));
+    CHECK("wrap: 10 s hides",             statusAutohideElapsed(nearMax, postWrap, ms));
+
+    // statusOverlayShown combiner: running gate + auto-hide decision together.
+    CHECK("offline never shows",         !statusOverlayShown(false, 0,    100,   ms));
+    CHECK("green fresh shows",            statusOverlayShown(true,  5000, 5000,  ms));
+    CHECK("green stale hides",           !statusOverlayShown(true,  5000, 20000, ms));
+    CHECK("running non-green shows",      statusOverlayShown(true,  0,    99999, ms)); // waiting
+    CHECK("disabled stays shown",         statusOverlayShown(true,  5000, 99999, 0));
+}
+
+// ---- 14. Bounty/crime authority + convergence (Wire.h pure decision logic) ------
+// Locks the protocol-45 H2 witness-local rules WITHOUT a live engine (the engine
+// read/write shims stay behind SEH in EngineCharState.cpp): the HOST is the sole
+// publisher (a join must NEVER push its own bounty state upstream), and the
+// receiver drops stale rows, skips converged rows, and picks the raise/clear
+// lever by the signed amount delta. These are the exact rules publishBounties /
+// applyBounties + applyBountyRow implement.
+static void testBounty() {
+    std::printf("== bounty/crime authority + convergence (Wire.h) ==\n");
+
+    // Value triples: a clean baseline vs a mid-session bounty.
+    BountyVal clean; clean.amount = 0;   clean.crimes = 0;      clean.claimed = 0;
+    BountyVal wanted; wanted.amount = 500; wanted.crimes = 0x20; wanted.claimed = 0;
+
+    // --- Publish gate: HOST authoritative (H2) ---
+    // Host, seeded, the row MOVED (0 -> 500): publish.
+    CHECK("host publishes a bounty that appeared",
+          bountyShouldSend(/*isHost*/1, /*seeded*/1, &clean, &wanted, /*resendDue*/0) == 1);
+    // Host, seeded, unchanged, no resend due: stay silent.
+    CHECK("host silent on an unchanged row",
+          bountyShouldSend(1, 1, &wanted, &wanted, 0) == 0);
+    // Host, seeded, unchanged, but a safety resend is due: publish.
+    CHECK("host resends an unchanged row when due",
+          bountyShouldSend(1, 1, &wanted, &wanted, 1) == 1);
+    // Host, NOT yet seeded (first sight of a shared-save bounty): silent seed.
+    CHECK("host seeds the shared-save baseline silently",
+          bountyShouldSend(1, 0, &clean, &wanted, 0) == 0);
+
+    // --- The discriminator: a JOIN never publishes (unidirectional host->clients) ---
+    // Even with a genuine local movement, a resend due, and a seeded row, a
+    // non-host caller must produce ZERO upstream traffic. This is the test that
+    // fails if the host-only authority is ever broken.
+    CHECK("join never publishes an appeared bounty",
+          bountyShouldSend(/*isHost*/0, 1, &clean, &wanted, 0) == 0);
+    CHECK("join never publishes even with a resend due",
+          bountyShouldSend(0, 1, &wanted, &wanted, 1) == 0);
+    // Join "revert" attempt: it received the host's 500, then its own engine
+    // reads its (forked, still-clean) copy as 0 and would try to stream that
+    // back. It must NOT - the host stays authoritative.
+    CHECK("join revert to local 0 is never sent upstream",
+          bountyShouldSend(0, 1, &wanted, &clean, 1) == 0);
+
+    // --- Receiver apply decision ---
+    int delta = -12345;
+    // Stale row: incoming seq <= the newest already applied -> drop, no write.
+    CHECK("apply drops a stale seq",
+          bountyApplyDecision(/*seqSeen*/7, /*incoming*/5, 500, 0, &delta) == BOUNTY_APPLY_SKIP_STALE);
+    // Fresh seq, local already at the target -> converged, no write (resend/echo).
+    CHECK("apply skips an already-converged row",
+          bountyApplyDecision(3, 9, 500, 500, &delta) == BOUNTY_APPLY_SKIP_CONVERGED);
+    // Fresh seq, raise 0 -> 500: additive lever, delta = +500.
+    delta = 0;
+    CHECK("apply raises with a positive delta",
+          bountyApplyDecision(3, 9, 500, 0, &delta) == BOUNTY_APPLY_ADD);
+    CHECK("apply raise delta is target-current", delta == 500);
+    // Fresh seq, raise 200 -> 500: delta = +300 (additive keeps engine derived state).
+    delta = 0;
+    CHECK("apply partial raise delta",
+          bountyApplyDecision(3, 9, 500, 200, &delta) == BOUNTY_APPLY_ADD);
+    CHECK("apply partial raise delta value", delta == 300);
+    // Fresh seq, target 0 with a live local bounty: clearBounty, not a delta.
+    delta = 999;
+    CHECK("apply clears when target is zero",
+          bountyApplyDecision(3, 9, 0, 500, &delta) == BOUNTY_APPLY_CLEAR);
+    // seqSeen == 0 (first ever row) must NOT be treated as stale.
+    CHECK("apply accepts the first row (seqSeen 0)",
+          bountyApplyDecision(0, 1, 500, 0, &delta) == BOUNTY_APPLY_ADD);
+
+    // --- Tag / identity ---
+    CHECK("PKT_BOUNTY tag is 44", PKT_BOUNTY == 44);
+    CHECK("PKT_BOUNTY distinct from CAM_HINT", PKT_BOUNTY != PKT_CAM_HINT);
+}
+
+// ---- 15. Per-sender stale-row guard (StaleGuard.h staleRowAccept) ----------------
+// Guards the symmetric-channel fix (2026-07-19): the faction (24), door (26)
+// and placed-building-door (28) channels are published by BOTH clients, each
+// stamping its own independent seq counter on rows for the SAME key. The old
+// guard kept ONE shared high-water mark per row, so once the faster sender
+// pushed seq=N, every packet from the other sender with seq <= N was dropped
+// as "stale" - one player silently stopped seeing the other's changes on that
+// row. staleRowAccept keys the mark by the packet's ownerId; this locks that
+// contract (and the unchanged single-sender discipline around it).
+static void testStaleGuard() {
+    std::printf("== per-sender stale-row guard (StaleGuard.h) ==\n");
+    const unsigned int A = 1, B = 2; // two peers publishing the SAME row
+
+    // Single-sender semantics unchanged: first row lands, duplicates (safety
+    // resends) and reordered stragglers drop, newer seqs land, loss-gaps jump.
+    {
+        std::map<unsigned int, unsigned int> row;
+        CHECK("first row from a sender applies",      staleRowAccept(row, A, 1));
+        CHECK("duplicate seq drops (safety resend)", !staleRowAccept(row, A, 1));
+        CHECK("newer seq applies",                    staleRowAccept(row, A, 2));
+        CHECK("reordered straggler drops",           !staleRowAccept(row, A, 1));
+        CHECK("gap jump applies (loss tolerated)",    staleRowAccept(row, A, 9));
+        CHECK("straggler behind the gap drops",      !staleRowAccept(row, A, 5));
+    }
+
+    // THE FIX: two senders write the SAME row with independent counters. A's
+    // counter is far ahead (seq 500); B's fresh seq=1 must still land. The
+    // pre-fix shared mark rejected exactly this packet (1 <= 500 -> "stale").
+    {
+        std::map<unsigned int, unsigned int> row;
+        CHECK("fast sender A seq=500 applies",  staleRowAccept(row, A, 500));
+        CHECK("slow sender B seq=1 still applies (the fix)",
+              staleRowAccept(row, B, 1));
+        // Per-sender discipline holds independently on both counters.
+        CHECK("B duplicate seq=1 drops",       !staleRowAccept(row, B, 1));
+        CHECK("B seq=2 applies",                staleRowAccept(row, B, 2));
+        CHECK("A straggler seq=499 drops",     !staleRowAccept(row, A, 499));
+        CHECK("A seq=501 applies",              staleRowAccept(row, A, 501));
+    }
+
+    // Regression documentation (the RED half): the pre-fix shared-counter
+    // guard, replayed on the same trace, drops B's fresh packet - proof this
+    // scenario detects the bug the per-sender map removes.
+    {
+        unsigned int sharedSeen = 0;   // pre-fix FacRow::seqSeen (one u32)
+        sharedSeen = 500;              // A's seq=500 row applied
+        bool bDropped = (sharedSeen != 0 && 1u <= sharedSeen); // B's seq=1 arrives
+        CHECK("shared counter would drop B's row (the bug)", bDropped);
+    }
+
+    // Interleaving: both sides toggling the same door alternately - every
+    // fresh packet from either side lands, every safety resend drops, and
+    // neither counter ever disturbs the other's progress.
+    {
+        std::map<unsigned int, unsigned int> row;
+        bool ok = true;
+        for (unsigned int s = 1; s <= 10; ++s) {
+            ok = ok &&  staleRowAccept(row, A, s);  // A's fresh row
+            ok = ok &&  staleRowAccept(row, B, s);  // B's fresh row, same key
+            ok = ok && !staleRowAccept(row, A, s);  // A's safety resend
+            ok = ok && !staleRowAccept(row, B, s);  // B's safety resend
+        }
+        CHECK("alternating same-row writes all land, resends all drop", ok);
+    }
+
+    // The guard state is per ROW: a second row's counters start clean, so a
+    // sender's high counter on one door never stales its rows on another.
+    {
+        std::map<unsigned int, unsigned int> door1, door2;
+        CHECK("row1 A seq=3 applies",                    staleRowAccept(door1, A, 3));
+        CHECK("row2 A seq=1 applies (rows independent)", staleRowAccept(door2, A, 1));
+    }
+}
+
+// ---- 16. Owner-side carried self-heal debounce (CarriedHeal.h) ------------------
+// Guards the SYNC_GAPS 16b fix: the owner of a carried body reconciles its LOCAL
+// isBeingCarried against the carrier's streamed TASK_CARRY_BODY claim. The step
+// must (a) stay quiet while a live stream claims the carry, (b) arm-then-fire only
+// after a full debounce window with NO claim (a one-batch stream blip must never
+// rip a genuine carry apart - the carryNoSeeTick lesson), and (c) re-arm after
+// firing so a release that failed to take retries a full window later.
+
+static void testCarriedHeal() {
+    std::printf("== owner-side carried heal debounce (CarriedHeal.h) ==\n");
+    const unsigned long DROP = 3000;
+    unsigned long tick = 0;
+
+    // Not carried: nothing to do, anchor stays disarmed.
+    tick = 0;
+    CHECK("not carried -> NONE",
+          carriedHealStep(false, false, 1000, DROP, &tick) == CARRIED_HEAL_NONE);
+    CHECK("not carried -> anchor disarmed", tick == 0);
+
+    // Carried + claimed by a live stream: believed, anchor stays disarmed.
+    tick = 0;
+    CHECK("carried+claimed -> NONE",
+          carriedHealStep(true, true, 1000, DROP, &tick) == CARRIED_HEAL_NONE);
+    CHECK("carried+claimed -> anchor disarmed", tick == 0);
+
+    // First unclaimed tick arms the window but must NOT act yet.
+    tick = 0;
+    CHECK("first unclaimed -> ARM",
+          carriedHealStep(true, false, 1000, DROP, &tick) == CARRIED_HEAL_ARM);
+    CHECK("ARM stamps the anchor", tick == 1000);
+
+    // Inside the window: still quiet (a stream blip shorter than the window).
+    CHECK("inside window -> NONE",
+          carriedHealStep(true, false, 1000 + DROP, DROP, &tick) == CARRIED_HEAL_NONE);
+    CHECK("window boundary is exclusive (== dropMs does not fire)", tick == 1000);
+
+    // A claim arriving mid-window disarms it - no release ever happens.
+    CHECK("claim mid-window -> NONE + disarm",
+          carriedHealStep(true, true, 2500, DROP, &tick) == CARRIED_HEAL_NONE &&
+          tick == 0);
+
+    // Full window with no claim: fire, and re-arm (anchor back to 0).
+    tick = 0;
+    carriedHealStep(true, false, 1000, DROP, &tick);           // arm at t=1000
+    CHECK("window elapsed -> FIRE",
+          carriedHealStep(true, false, 1000 + DROP + 1, DROP, &tick) ==
+          CARRIED_HEAL_FIRE);
+    CHECK("FIRE re-arms (anchor cleared)", tick == 0);
+
+    // Still stuck after a failed release: the NEXT pass arms again, then fires
+    // again a full window later (throttled retry, never a per-tick drop spam).
+    CHECK("post-FIRE re-arms on next pass",
+          carriedHealStep(true, false, 5000, DROP, &tick) == CARRIED_HEAL_ARM);
+    CHECK("post-FIRE retry fires a full window later",
+          carriedHealStep(true, false, 5000 + DROP + 1, DROP, &tick) ==
+          CARRIED_HEAL_FIRE);
+
+    // Body put down locally (drop finally applied): disarmed, back to quiet.
+    carriedHealStep(true, false, 12000, DROP, &tick);          // re-armed
+    CHECK("local drop applied -> NONE + disarm",
+          carriedHealStep(false, false, 12500, DROP, &tick) == CARRIED_HEAL_NONE &&
+          tick == 0);
+}
+
+static void testProdAuthority() {
+    std::printf("== production per-object authority (ProdAuthority.h) ==\n");
+
+    // Maquina baked (sin colocador): manda el HOST. Preserva EXACTAMENTE el
+    // comportamiento host-autoritativo previo. placedByLocal es irrelevante.
+    CHECK("baked: host es autoridad",
+          prodIsLocalAuthority(/*isHost*/true,  /*isPlaced*/false, /*placedByLocal*/false));
+    CHECK("baked: join NO es autoridad",
+          !prodIsLocalAuthority(/*isHost*/false, /*isPlaced*/false, /*placedByLocal*/false));
+
+    // Maquina placed: manda quien la COLOCO, sea host o join. Este es el fix:
+    // el join conduce las maquinas que el construyo.
+    CHECK("placed por join: join es autoridad",
+          prodIsLocalAuthority(/*isHost*/false, /*isPlaced*/true, /*placedByLocal*/true));
+    CHECK("placed por peer (proxy en join): join NO es autoridad",
+          !prodIsLocalAuthority(/*isHost*/false, /*isPlaced*/true, /*placedByLocal*/false));
+    CHECK("placed por host: host es autoridad",
+          prodIsLocalAuthority(/*isHost*/true,  /*isPlaced*/true, /*placedByLocal*/true));
+    CHECK("placed por peer (proxy en host): host NO es autoridad",
+          !prodIsLocalAuthority(/*isHost*/true,  /*isPlaced*/true, /*placedByLocal*/false));
+
+    // Invariante de particion: para CUALQUIER maquina, exactamente UN lado es la
+    // autoridad -> nunca hay dos escritores sobre la misma maquina. Barremos las
+    // 4 combinaciones (baked/placed x colocada-por-host/join) y comprobamos que
+    // host y join no son ambos autoridad ni ambos no-autoridad de la misma.
+    // baked: host lo posee en los dos clientes (placedByLocal solo aplica a placed).
+    CHECK("baked: exactamente una autoridad",
+          prodIsLocalAuthority(true, false, false) != prodIsLocalAuthority(false, false, false));
+    // placed colocada por el HOST: en el host placedByLocal=true, en el join =false.
+    CHECK("placed-by-host: exactamente una autoridad",
+          prodIsLocalAuthority(true, true, true) != prodIsLocalAuthority(false, true, false));
+    // placed colocada por el JOIN: en el join placedByLocal=true, en el host =false.
+    CHECK("placed-by-join: exactamente una autoridad",
+          prodIsLocalAuthority(false, true, true) != prodIsLocalAuthority(true, true, false));
+}
+
+// Walk-drive deceleration taper (on-stop overshoot/snap-back fix). The taper is
+// the load-bearing pure fraction the drive multiplies lead/catch-up/cap by as the
+// source decelerates; locking its clamp + monotonicity here proves the "converge
+// to the stop, don't overrun" contract without a game launch.
+static void testDriveTaper() {
+    std::printf("\n== walk-drive deceleration taper ==\n");
+    using coop::driveSpeedTaper;
+
+    const float REF = 6.0f; // CATCHUP_REF_SPEED
+
+    // Full strength at/above the reference cruise speed (clamped high).
+    CHECK("at cruise = 1",       driveSpeedTaper(6.0f, REF) == 1.0f);
+    CHECK("above cruise = 1",    driveSpeedTaper(50.0f, REF) == 1.0f);
+    // Zero at a full stop (the whole point: no lead/catch-up push past the mark).
+    CHECK("at stop = 0",         driveSpeedTaper(0.0f, REF) == 0.0f);
+    // Linear in between: half the reference speed -> half strength.
+    CHECK("half speed = 0.5",    driveSpeedTaper(3.0f, REF) == 0.5f);
+    // Negative velocity noise clamps to 0 (never a negative cap/lead).
+    CHECK("negative clamps to 0", driveSpeedTaper(-2.0f, REF) == 0.0f);
+    // Monotonic non-decreasing as speed rises (a faster source never tapers more).
+    CHECK("monotonic 1<2u",      driveSpeedTaper(1.0f, REF) < driveSpeedTaper(2.0f, REF));
+    CHECK("monotonic 2<5u",      driveSpeedTaper(2.0f, REF) < driveSpeedTaper(5.0f, REF));
+    // Defensive: a non-positive reference disables the taper (full strength) so a
+    // mis-tuned constant can never freeze the drive at 0.
+    CHECK("zero ref = full",     driveSpeedTaper(3.0f, 0.0f) == 1.0f);
+    CHECK("neg ref = full",      driveSpeedTaper(3.0f, -1.0f) == 1.0f);
+
+    // The cap formula the drive uses: base * (1 + 1.5*frac) spans 1x (stop) to
+    // 2.5x (cruise) - guard the endpoints so the "2.5x cruise -> 1x stop" intent
+    // can't silently drift if the taper shape ever changes.
+    CHECK("cap 1x at stop",   (1.0f + 1.5f * driveSpeedTaper(0.0f, REF)) == 1.0f);
+    CHECK("cap 2.5x cruise",  (1.0f + 1.5f * driveSpeedTaper(6.0f, REF)) == 2.5f);
+}
+
+// ---- 12. Ephemeral toast visibility clock (ToastTimer.h toastVisible) -----------
+// Guards the peer connect/disconnect on-screen TOAST (2026-07-21): armPeerToast
+// records GetTickCount at the connect/leave edge and coopPanelDrive keeps the
+// EngineUi toast label shown only while toastVisible() is true, then disarms so
+// the label self-hides - the "momentary transition notice" distinct from the
+// persistent status banner. This locks the pure timing: un-armed is never shown,
+// an armed toast shows through the window and hides exactly at TOAST_SHOW_MS, and
+// the unsigned subtraction tolerates a GetTickCount wrap mid-window.
+static void testToastTimer() {
+    std::printf("== ephemeral toast visibility clock (ToastTimer.h) ==\n");
+    using coop::engine::toastVisible;
+    const unsigned long dur = coop::engine::TOAST_SHOW_MS; // 4000
+
+    // Un-armed: never visible, whatever the clock says.
+    CHECK("unarmed never visible",        !toastVisible(false, 0,     999999, dur));
+    CHECK("unarmed never visible (armMs)",!toastVisible(false, 10000, 10000,  dur));
+
+    // Armed: visible from the arming instant, through the window, hidden AT the
+    // boundary (elapsed >= duration) and after.
+    CHECK("armed visible at t0",           toastVisible(true, 10000, 10000, dur));
+    CHECK("armed visible mid-window",      toastVisible(true, 10000, 12000, dur));
+    CHECK("armed visible at 3999 ms",      toastVisible(true, 10000, 13999, dur));
+    CHECK("armed hidden AT window (4000)", !toastVisible(true, 10000, 14000, dur));
+    CHECK("armed hidden past window",      !toastVisible(true, 10000, 20000, dur));
+
+    // GetTickCount wrap: armed 100 ms before the 2^32 rollover, the unsigned delta
+    // still measures true elapsed time across the boundary.
+    const unsigned long nearMax  = 0xFFFFFFFFul - 100; // armed 100 ms before wrap
+    const unsigned long preWrap  = nearMax + 50;       // 50 ms later, no overflow
+    const unsigned long postWrap = 1899UL;             // (nearMax + 2000) mod 2^32
+    const unsigned long postHide = 3999UL;             // (nearMax + 4100) mod 2^32
+    CHECK("wrap: 50 ms still visible",     toastVisible(true, nearMax, preWrap,  dur));
+    CHECK("wrap: 2000 ms still visible",   toastVisible(true, nearMax, postWrap, dur));
+    CHECK("wrap: 4100 ms hidden",         !toastVisible(true, nearMax, postHide, dur));
+
+    // Duration sanity: a few seconds - long enough to read, short enough to feel
+    // momentary and not be mistaken for the persistent banner.
+    CHECK("toast window sane (2-8 s)", dur >= 2000 && dur <= 8000);
+}
+
+// ---- Free camera math (src/plugin/core/FreeCamMath.h) ------------------------
+// La misma lógica pura que FreeCamera.cpp vuelca en la Ogre::Camera real: vector
+// de vista desde yaw/pitch, ejes de movimiento y el paso de integración.
+static bool approx(float a, float b, float eps) {
+    float d = a - b; if (d < 0) d = -d; return d <= eps;
+}
+
+static void testFreeCamMath() {
+    std::printf("== free camera math (view vector + movement step) ==\n");
+
+    // 1. En reposo (yaw=0, pitch=0) la cámara mira a -Z (convención Ogre).
+    FcVec3 f0 = fcForward(0.0f, 0.0f);
+    CHECK("forward(0,0) mira a -Z",
+          approx(f0.x, 0.0f, 1e-5f) && approx(f0.y, 0.0f, 1e-5f) && approx(f0.z, -1.0f, 1e-5f));
+
+    // 2. El vector de vista es unitario para varios ángulos.
+    {
+        FcVec3 f = fcForward(0.7f, 0.3f);
+        float len = std::sqrt(f.x * f.x + f.y * f.y + f.z * f.z);
+        CHECK("forward es unitario", approx(len, 1.0f, 1e-4f));
+    }
+
+    // 3. forward (horizontal) y right son ortogonales -> strafe limpio.
+    {
+        FcVec3 fh = fcForward(1.1f, 0.0f); // pitch 0 => horizontal
+        FcVec3 r  = fcRight(1.1f);
+        float dot = fh.x * r.x + fh.y * r.y + fh.z * r.z;
+        CHECK("forward_h _|_ right", approx(dot, 0.0f, 1e-4f));
+        CHECK("right es horizontal (y=0)", approx(r.y, 0.0f, 1e-6f));
+    }
+
+    // 4. Avanzar (W) en reposo desplaza exactamente speed*dt hacia -Z.
+    {
+        FcInput in; std::memset(&in, 0, sizeof(in)); in.fwd = true;
+        FcVec3 o = { 0.0f, 0.0f, 0.0f };
+        FcVec3 p = fcStep(o, 0.0f, 0.0f, in, /*speed*/ 10.0f, /*turbo*/ 4.0f, /*dt*/ 0.5f);
+        CHECK("W avanza speed*dt hacia -Z",
+              approx(p.x, 0.0f, 1e-4f) && approx(p.y, 0.0f, 1e-4f) && approx(p.z, -5.0f, 1e-4f));
+    }
+
+    // 5. Subir (E) mueve +Y en world; el desplazamiento vale speed*dt.
+    {
+        FcInput in; std::memset(&in, 0, sizeof(in)); in.up = true;
+        FcVec3 o = { 1.0f, 2.0f, 3.0f };
+        FcVec3 p = fcStep(o, 2.0f, 0.5f, in, 8.0f, 4.0f, 0.25f);
+        CHECK("E sube +Y en world", approx(p.y, 2.0f + 2.0f, 1e-4f)); // 8*0.25 = 2
+        CHECK("E no cambia X/Z", approx(p.x, 1.0f, 1e-4f) && approx(p.z, 3.0f, 1e-4f));
+    }
+
+    // 6. Diagonal (W+D) NO va más rápido que recto: |desplazamiento| == speed*dt.
+    {
+        FcInput in; std::memset(&in, 0, sizeof(in)); in.fwd = true; in.right = true;
+        FcVec3 o = { 0.0f, 0.0f, 0.0f };
+        FcVec3 p = fcStep(o, 0.9f, 0.2f, in, 12.0f, 4.0f, 0.1f);
+        float dx = p.x - o.x, dy = p.y - o.y, dz = p.z - o.z;
+        float mag = std::sqrt(dx * dx + dy * dy + dz * dz);
+        CHECK("diagonal normalizada (|d|==speed*dt)", approx(mag, 12.0f * 0.1f, 1e-3f));
+    }
+
+    // 7. Turbo multiplica la velocidad por turboMul.
+    {
+        FcInput a; std::memset(&a, 0, sizeof(a)); a.fwd = true;
+        FcInput b = a; b.turbo = true;
+        FcVec3 o = { 0.0f, 0.0f, 0.0f };
+        FcVec3 pa = fcStep(o, 0.0f, 0.0f, a, 10.0f, 3.0f, 0.2f);
+        FcVec3 pb = fcStep(o, 0.0f, 0.0f, b, 10.0f, 3.0f, 0.2f);
+        CHECK("turbo x3", approx(pb.z, pa.z * 3.0f, 1e-4f));
+    }
+
+    // 8. Sin input, la posición no cambia.
+    {
+        FcInput in; std::memset(&in, 0, sizeof(in));
+        FcVec3 o = { 5.0f, 6.0f, 7.0f };
+        FcVec3 p = fcStep(o, 1.0f, 0.5f, in, 50.0f, 4.0f, 1.0f);
+        CHECK("sin input no se mueve",
+              approx(p.x, 5.0f, 1e-6f) && approx(p.y, 6.0f, 1e-6f) && approx(p.z, 7.0f, 1e-6f));
+    }
+
+    // 9. El pitch se clampa a ~±85° (no da la vuelta de campana).
+    {
+        float yaw = 0.0f, pitch = 0.0f;
+        fcApplyLook(&yaw, &pitch, 0.0f, 100.0f); // empuja el pitch muy arriba
+        CHECK("pitch clamp superior", pitch <= 1.4836f && pitch >= 1.4834f);
+        fcApplyLook(&yaw, &pitch, 0.0f, -100.0f);
+        CHECK("pitch clamp inferior", pitch >= -1.4836f && pitch <= -1.4834f);
+    }
+}
+
+// ---- join LOAD_GO evaluate-vs-load policy (title-screen stall fix) -----------
+
+static void testLoadGoGate() {
+    using namespace coop::sync;
+    std::printf("== load-go gate (join follows host's coordinated load) ==\n");
+
+    // Stale/duplicate: a GO whose id we've already handled is skipped, whatever
+    // its fingerprint or the subsystem state.
+    CHECK("stale GO (id == seen) skipped",
+          decideLoadGo(4, 4, 0x500aab2a, 0x500aab2a, true) == LOADGO_SKIP_STALE);
+    CHECK("old GO (id < seen) skipped",
+          decideLoadGo(3, 5, 0x11111111, 0x11111111, true) == LOADGO_SKIP_STALE);
+
+    // THE BUG (real session log 2026-07-21): host GO id=4 name='autosave2'
+    // hostFp=500aab2a, join has no copy (localFp=0) and is still at the title
+    // menu so savesReady()==false. This MUST NACK to pull the transfer NOW - the
+    // old code gated the whole evaluation on savesReady() and stranded it for
+    // 7.5 minutes. The missing-copy path is independent of savesReady().
+    CHECK("MISSING copy at title (saves NOT ready) -> NACK now (the bug)",
+          decideLoadGo(4, 0, 0x500aab2a, 0x00000000, false) == LOADGO_NACK_TRANSFER);
+    CHECK("MISSING copy (saves ready) -> NACK",
+          decideLoadGo(4, 0, 0x500aab2a, 0x00000000, true) == LOADGO_NACK_TRANSFER);
+
+    // Diverged copy (present but different fingerprint) also NACKs regardless of
+    // the subsystem - we need the host's exact folder either way.
+    CHECK("DIVERGED copy (saves not ready) -> NACK",
+          decideLoadGo(7, 6, 0xaaaaaaaa, 0xbbbbbbbb, false) == LOADGO_NACK_TRANSFER);
+    CHECK("DIVERGED copy (saves ready) -> NACK",
+          decideLoadGo(7, 6, 0xaaaaaaaa, 0xbbbbbbbb, true) == LOADGO_NACK_TRANSFER);
+
+    // Exact match + subsystem ready -> load immediately (both pre-shared the
+    // same save, in-game or title once the menu is up).
+    CHECK("MATCH + saves ready -> load now",
+          decideLoadGo(9, 8, 0x500aab2a, 0x500aab2a, true) == LOADGO_LOAD_NOW);
+
+    // Exact match but subsystem NOT ready yet (title screen, before the save
+    // menu populates) -> defer the load, do NOT re-NACK a copy we already have.
+    CHECK("MATCH + saves not ready -> defer load",
+          decideLoadGo(9, 8, 0x500aab2a, 0x500aab2a, false) == LOADGO_DEFER_LOAD);
+
+    // A zero local fingerprint that happens to equal a zero host fingerprint is
+    // still a MISSING copy, never a match (localFp==0 is the "no folder"
+    // sentinel), so it NACKs rather than "loading" an absent save.
+    CHECK("both fp zero -> treated as MISSING, NACK",
+          decideLoadGo(2, 1, 0x00000000, 0x00000000, true) == LOADGO_NACK_TRANSFER);
+}
+
+// ---- host-only game-speed / pause authority (SpeedGate.h) -------------------
+// Locks the shift from consensus min(host, join) to host-only authority:
+//  * the effective the host applies/broadcasts is the HOST's own request alone,
+//    never lowered by the join (a join can no longer pause/slow the session);
+//  * the combat cap (1x while a tracked squad fights) is preserved and still
+//    honours the peer combat bit - it is a balance rule, not a speed change;
+//  * a non-host that acted is the (only) case that is denied (drives the toast).
+
+static void testSpeedGate() {
+    using namespace coop::sync;
+    std::printf("== speed gate (host-only speed/pause authority) ==\n");
+
+    // Host request is honoured verbatim outside combat (0.25x .. 5x, pause=0).
+    CHECK("host 1x -> 1x",            effectiveHostSpeed(1.0f, false) == 1.0f);
+    CHECK("host 5x -> 5x",           effectiveHostSpeed(5.0f, false) == 5.0f);
+    CHECK("host pause (0) -> 0",     effectiveHostSpeed(0.0f, false) == 0.0f);
+    CHECK("host unsampled (<0) -> 1x", effectiveHostSpeed(-1.0f, false) == 1.0f);
+
+    // THE FIX: the join's request is NOT a parameter - there is no way for a
+    // join to lower the effective. Whatever the join wanted, the host at 5x
+    // stays 5x (old consensus would have dropped to the join's min).
+    CHECK("host 5x is host-only (join cannot lower it)",
+          effectiveHostSpeed(5.0f, false) == 5.0f);
+
+    // Combat cap: forces 1x when a tracked squad fights, but only downward and
+    // NEVER force-unpauses (pause 0 stays 0; a sub-1x host speed is untouched).
+    CHECK("combat caps 5x -> 1x",    effectiveHostSpeed(5.0f, true) == 1.0f);
+    CHECK("combat leaves 1x at 1x",  effectiveHostSpeed(1.0f, true) == 1.0f);
+    CHECK("combat never unpauses",   effectiveHostSpeed(0.0f, true) == 0.0f);
+    CHECK("combat does not raise slow speed",
+          effectiveHostSpeed(0.5f, true) == 0.5f);
+
+    // Denial predicate: only a non-host that actually acted is denied. The host
+    // is always authoritative; an idle join (no action) is not denied.
+    CHECK("host acting is never denied",   !shouldDenySpeedInput(true,  true));
+    CHECK("host idle is never denied",     !shouldDenySpeedInput(true,  false));
+    CHECK("join acting IS denied",          shouldDenySpeedInput(false, true));
+    CHECK("join idle is not denied",       !shouldDenySpeedInput(false, false));
+}
+
 int main() {
     std::printf("prototest: KenshiCoop wire/hash/interp unit layer (protocol v%u)\n",
                 (unsigned)PROTOCOL_VERSION);
@@ -1534,6 +2324,9 @@ int main() {
     testEngineFaults();
     testEngineCaps();
     testChangeGate();
+    testDriveTaper();
+    testLoadGoGate();
+    testSpeedGate();
     testRoundTrips();
     testFraming();
     testSaveCrc();
@@ -1543,12 +2336,24 @@ int main() {
     testInterp();
     testOwnRanks();
     testSteamIdParse();
+    testNametag();
+    testLastPeerPersist();
     testWorkPoseMatch();
+    testFreeCamMath();
     testTaskClear();
     testDeathRekey();
     testInboundLifecycle();
     testFlushWorldStateContract();
     testTeardownOrdering();
+    testJailAnchor();
+    testSaveXfer();
+    testMoneyReconcile();
+    testStatusAutohide();
+    testBounty();
+    testStaleGuard();
+    testCarriedHeal();
+    testProdAuthority();
+    testToastTimer();
     std::printf("\nprototest: %d/%d checks passed%s\n",
                 g_total - g_failed, g_total, g_failed ? " - FAIL" : " - PASS");
     return g_failed;

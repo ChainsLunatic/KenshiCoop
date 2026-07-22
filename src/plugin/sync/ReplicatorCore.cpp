@@ -54,6 +54,7 @@ Replicator::Replicator()
       speedMyCombat_(false), speedPeerCombat_(false), speedLastSet_(-1.0f),
       speedSeqOut_(1), speedSeqSeen_(0),
       speedLastSendMs_(0), speedCombatSampleMs_(0), speedCombatHoldMs_(0),
+      speedDeniedEdge_(false),
       spawnSync_(false), spawnPosLogMs_(0),
       spawnMintRadius_(0.0f), censusScanMs_(0),
       moneySync_(true), recruitSync_(true),
@@ -66,10 +67,11 @@ Replicator::Replicator()
       prodSeqOut_(1), prodSampleMs_(0), prodSync_(true),
       researchSeqOut_(1), researchSampleMs_(0), researchSync_(true),
       weatherSync_(true), weatherSeqOut_(1), weatherSeqSeen_(0), weatherRoleSet_(false),
+      bountySeqOut_(1), bountySampleMs_(0), bountySync_(true), bountyBaseline_(false),
       storeSync_(false), contCensusMs_(0),
       timeSync_(true), timeSlew_(1.0f), timeSeqOut_(1), timeSeqSeen_(0),
       timeLastSendMs_(0), timeLastLogMs_(0), timeSlewApplied_(-1.0f),
-      lifeSweepMs_(0) {
+      lifeSweepMs_(0), showNametag_(true) {
     peerCam_[0] = peerCam_[1] = peerCam_[2] = 0.0f;
 }
 
@@ -177,6 +179,13 @@ void Replicator::resetSession() {
          mi != debugMarkers_.end(); ++mi)
         engine::markerDestroy(mi->second.label);
     debugMarkers_.clear();
+    // Same for the normal-play nametag labels: they too hold OLD-world raw
+    // Character* plus GUI label objects we own - destroy and drop before the
+    // pointers can dangle into the new session.
+    for (std::map<Character*, NametagMarker>::iterator ni = nametagMarkers_.begin();
+         ni != nametagMarkers_.end(); ++ni)
+        engine::markerDestroy(ni->second.label);
+    nametagMarkers_.clear();
     hostBody_.clear();
     attackerOf_.clear();
     combatCapMs_.clear();
@@ -194,6 +203,7 @@ void Replicator::resetSession() {
     peerCamMs_ = 0;
     furnPeerPend_.clear();
     ownFurnExit_.clear();
+    ownCarriedNoSee_.clear(); // 16b owner-side carry heal: old world's anchors
     // Session maps + change-gate baselines (they describe the OLD world; the
     // reloaded save re-seeds them on first sample).
     ownBuilds_.clear();
@@ -228,7 +238,7 @@ void Replicator::resetSession() {
     medRecv_.clear();
     medNpc_.clear();
     statsPub_.clear();
-    moneyPub_.clear();
+    factionMoney_ = coop::MoneyState(); // re-seed the shared-wallet baseline on load
     stealthPub_.clear();
     pinOwned_.clear();
     pinPeer_.clear();
@@ -257,6 +267,7 @@ void Replicator::resetSession() {
     speedLastSendMs_  = 0;
     speedCombatSampleMs_ = 0;
     speedCombatHoldMs_ = 0;
+    speedDeniedEdge_  = false; // host-only authority: no pending join-denied toast
     timeSlew_         = 1.0f;
     timeSeqSeen_      = 0;
     timeLastSendMs_   = 0;

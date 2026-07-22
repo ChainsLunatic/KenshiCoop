@@ -32,7 +32,10 @@
 #include "../core/WorkPose.h" // poseClearElapsed (debounced task-clear predicate)
 #include "../core/DeathLatch.h" // rekeyCarryLatch (down/death latch carry on re-key)
 #include "ChangeGate.h" // Phase 6: shared change-gated send/accept policy
+#include "DriveTaper.h" // walk-drive deceleration-taper math (pure, unit-tested)
 #include "SyncContext.h" // Phase 6: per-tick channel call environment
+#include "../core/JailAnchor.h" // chainAnchorStep (captive kind-conflict anchor, spike 58)
+#include "../core/CarriedHeal.h" // carriedHealStep (owner-side carried self-heal, 16b)
 #include "../CoopLog.h"
 
 #include <windows.h> // GetTickCount
@@ -87,6 +90,23 @@ const float REISSUE_DIST = 1.0f;  // re-issue the walk order only when tgt moved
 const float LEAD_SECONDS = 0.6f;  // project the walk target this far along source velocity
 const float NPC_MOVE_VEL = 0.75f; // NPC est. velocity (u/s) above which it is "walking"
                                   // (vs a fidget/turn in place -> treat as at rest)
+// Walk-drive on-stop overshoot/snap-back fix (concept ported from CTRL-ALT-E/
+// KENSHI-CO-OP e36b960). As the driven source decelerates, the lead point, the
+// gap catch-up boost, and the speed cap all taper with its TRUE translation
+// velocity so it converges to the stop instead of overrunning and rubberbanding.
+const float CATCHUP_REF_SPEED = 6.0f; // source speed (u/s) at/above which catch-up +
+                                      // lead run at full strength; below it they taper
+                                      // to 0 as the source stops (driveSpeedTaper)
+const float SETTLE_VEL   = 4.0f;  // TRUE translation velocity (u/s, from the snapshot
+                                  // stream - NOT the host's cSpeed field, which decays
+                                  // slowly and still reads several u/s for many frames
+                                  // AFTER the body physically stopped) below which a
+                                  // still-"moving"-classified squad body is HELD on the
+                                  // authoritative pos (glide-in) instead of walk-driven,
+                                  // so it can neither coast past the stop nor snap back
+const float MAX_CATCHUP_STEP = 0.40f; // at-stop glide-in: max per-frame move toward the
+                                      // mark, CONSTANT speed (no big first-frame jump off
+                                      // a lag - a proportional first step reads as a snap)
 const unsigned long TASK_GRACE_MS = 4000;  // settle time before drift-checking a pose
 const float TASK_DRIFT_MAX = 4.0f;         // committed pose drift beyond which we park
 const unsigned long TASK_RETRY_MS = 1500;  // throttle between pose apply attempts
@@ -163,6 +183,11 @@ const unsigned long ATTR_WINDOW_MS = 3000; // remember a combatant's victim this
 const unsigned long CARRY_HEAL_MS = 1500; // min gap between self-heal pickups
 const unsigned long CARRY_DROP_MS = 3000; // stream must stop reporting the carry
                                           // this long before the local copy drops
+const unsigned long CARRY_CLAIM_STALE_MS = 30000; // owner-side heal (16b): a streamed
+                                          // row older than this no longer counts as
+                                          // claiming its carry subject (matches the
+                                          // targets_ prune horizon - a WAN stall must
+                                          // never read as a host-side drop)
 // Furniture occupancy sync (protocol 19): same shape as the carry self-heal.
 const unsigned long FURN_HEAL_MS = 1500;  // min gap between self-heal enters
 const unsigned long FURN_EXIT_MS = 3000;  // stream must stop reporting occupancy

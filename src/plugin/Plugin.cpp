@@ -30,14 +30,17 @@
 #include "core/Config.h"
 #include "core/OwnRanks.h"
 #include "core/Inbound.h"
+#include "core/StatusAutohide.h" // persistent status-banner auto-hide policy
 #include "net/NetLink.h"
 #include "net/SteamP2P.h"
 #include "net/SteamInvite.h"
 #include "game/Engine.h"
 #include "game/EngineUi.h"       // Phase 5a: F2 co-op panel + status overlay
+#include "game/ToastTimer.h"     // ephemeral peer connect/disconnect toast clock
 #include "game/EngineScenario.h" // Phase 5a: auto-bake scene builders
 #include "sync/Replicator.h"
 #include "sync/SaveXfer.h"
+#include "sync/LoadGate.h"     // join LOAD_GO evaluate-vs-load policy (title stall fix)
 #ifdef KENSHICOOP_HARNESS
 #include "test/Scenario.h" // scenario runner: Harness/Debug builds only (Phase 1)
 #endif
@@ -118,6 +121,11 @@ struct SessionController {
     std::string  loadXferPending;  // host: save awaiting post-reload transfer (NACK)
     std::string  loadAfterCommit;  // join: save to load once its transfer commits
     coop::u32    loadCommitBase;   // join: savexfer::commitSeq() at NACK time
+    // A matched LOAD_GO (local copy == host's) received while still at the title
+    // screen, whose engine load had to wait for savesReady(). Latched here and
+    // issued once the save subsystem comes up, so evaluating the GO (and, on a
+    // miss, NACKing for the transfer) never blocks on the subsystem. Empty = none.
+    std::string  loadReadyPending; // join: matched save to load once savesReady()
     // Deferred-signal backstop: SaveManager::load only SETS the LOADGAME signal;
     // it can sit unconsumed mid-session. Armed on every coordinated load issue;
     // if the swap hasn't started after the grace window, pump execute() once.
@@ -151,6 +159,7 @@ coop::u32&   g_loadReqId       = g_session.loadReqId;
 std::string& g_loadXferPending = g_session.loadXferPending;
 std::string& g_loadAfterCommit = g_session.loadAfterCommit;
 coop::u32&   g_loadCommitBase  = g_session.loadCommitBase;
+std::string& g_loadReadyPending = g_session.loadReadyPending;
 DWORD&       g_loadPumpArmTick  = g_session.loadPumpArmTick;
 
 // Scenario harness state. Harness/Debug builds only - the shipped Release DLL
@@ -176,6 +185,38 @@ const DWORD     CRAFT_REARM_MS  = 3000; // re-issue the work goal at most this o
 const DWORD  SWAP_MIN_MS        = 400;   // shorter world-swap dips are flicker, not a reload
 const DWORD  LOAD_PUMP_GRACE_MS = 2000;  // deferred-LOADGAME backstop grace window
 
+// Ephemeral peer connect/disconnect toast (EngineUi coopToastTick). Purely a UI
+// blip - NOT session lifecycle state, so it lives as loose statics here rather
+// than in SessionController: it self-expires after TOAST_SHOW_MS and needs no
+// reset on a session boundary. processNetEvents arms it on a real connect/leave
+// edge; coopPanelDrive polls toastVisible() each frame and drives the label.
+bool         g_toastArmed = false; // a transition toast is currently timed
+DWORD        g_toastArmMs = 0;     // GetTickCount at the arming edge
+std::string  g_toastText;          // "Peer connected" / "Peer disconnected"
+int          g_toastState = 0;     // overlay colour state (2 = green, 0 = red)
+DWORD        g_speedDenyToastMs = 0; // last "only the host" toast (join speed-deny throttle)
+const DWORD  SPEED_DENY_TOAST_COOLDOWN_MS = 2000; // don't re-arm the deny toast every click
+
+// Arm the ephemeral toast for a peer transition. connected=true -> green
+// "Peer connected"; false -> red "Peer disconnected". Records the wall clock so
+// coopPanelDrive can time out the banner via coop::engine::toastVisible().
+void armPeerToast(bool connected) {
+    g_toastText  = connected ? "Peer connected" : "Peer disconnected";
+    g_toastState = connected ? 2 : 0;
+    g_toastArmMs = GetTickCount();
+    g_toastArmed = true;
+}
+
+// Arm the ephemeral toast with an arbitrary informational message (host-only
+// speed authority feedback). Same timing/plumbing as armPeerToast; state picks
+// the overlay colour (0 = red/attention, 2 = green).
+void armInfoToast(const char* text, int state) {
+    g_toastText  = text;
+    g_toastState = state;
+    g_toastArmMs = GetTickCount();
+    g_toastArmed = true;
+}
+
 // Original function pointers, filled by KenshiLib::AddHook.
 void (*g_mainLoop_orig)(GameWorld*, float) = 0;
 void (*g_titleUpdate_orig)(TitleScreen*)   = 0;
@@ -186,6 +227,7 @@ void (*g_titleUpdate_orig)(TitleScreen*)   = 0;
 void startNetworking();
 void coopUiConnect(bool isHost, bool useSteam, unsigned long long peerId);
 void coopUiDisconnect();
+void coopUiToggleNametag(bool show);
 
 // Log to BOTH our dedicated per-line-flushed file (what the test runner reads)
 // and the engine's kenshi.log (handy when attached live).
@@ -265,6 +307,30 @@ void processNetEvents(GameWorld* gw) {
     std::deque<coop::u32> conns, leaves;
     g_inbound.drainConnects(conns);
     g_inbound.drainLeaves(leaves);
+    // Ordering note (connect vs leave in the same drain batch): conn_ and leave_
+    // are two SEPARATE net-thread queues, so draining them independently LOSES
+    // the true cross-queue interleave - from here we cannot tell "connect then
+    // leave" (a blip, ends absent) from "leave then connect" (a reconnect, ends
+    // present). We process connects first, then leaves, then the unconditional
+    // crash-cleanup at the bottom. Crucially, that trailing
+    // clearPeerReplicationState()/resetSession() runs whenever ANY leave is in
+    // the batch, AFTER both loops, and wipes the very row/build maps a connect's
+    // onPeerConnected() resync re-arms - so it is ORDER-INDEPENDENT: swapping
+    // these two loops would NOT change the same-batch outcome (the connect's
+    // resync is reset either way; only its already-queued outbound re-announce
+    // survives). We deliberately keep this order and let the batch resolve to
+    // the clean/absent state, because:
+    //  - The safety-critical proxy despawn (clearPeerReplicationState) is
+    //    unconditional and thus never at risk from ordering.
+    //  - A real reconnect's connect and leave edges are many ticks apart, so
+    //    they land in SEPARATE batches: the leave batch cleans, a LATER connect
+    //    batch resyncs correctly. The same-batch collision is a rare timing
+    //    edge that self-heals via the peers' periodic safety resends (RESEND_MS)
+    //    plus that subsequent connect edge.
+    // A same-batch reconnect that keeps its resync would require running the
+    // connect handling AFTER the trailing clear - a larger restructure that
+    // would leave a genuine blip pointing g_peerPresent at a gone peer; not
+    // worth it for a rare, self-healing case. (Re-audit if multi-peer lands.)
     for (std::deque<coop::u32>::iterator it = conns.begin(); it != conns.end(); ++it) {
         char b[96];
         _snprintf(b, sizeof(b) - 1, "handshake: peer present id=%u (local id=%u)",
@@ -278,6 +344,9 @@ void processNetEvents(GameWorld* gw) {
         if (g_cfg.latejoinSync) g_repl.onPeerConnected(g_net, g_net.localId());
         else coopLog("[latejoin] connect edge seen, resync OFF (gate)");
         g_peerPresent = true;
+        // Pop the ephemeral "Peer connected" toast at the exact connect edge
+        // (distinct from the persistent status banner, which only reflects state).
+        armPeerToast(true);
         // Coordinated save (protocol 31): while connected under save-sync,
         // the JOIN never writes a save locally - the host's save is
         // authoritative and a local save press forwards as PKT_SAVE_REQ.
@@ -302,6 +371,9 @@ void processNetEvents(GameWorld* gw) {
         // release any carry or occupancy its driven copies still hold.
         if (gw && (g_cfg.carrySync || g_cfg.furnSync)) g_repl.sweepCarries(gw);
         g_peerPresent = false;
+        // Pop the ephemeral "Peer disconnected" toast at the exact leave edge -
+        // the momentary notice the persistent banner (now back to "waiting") lacks.
+        armPeerToast(false);
         // Coordinated save: disconnected = solo again; local saves must work.
         if (!g_cfg.isHost && g_cfg.saveSync) {
             coop::engine::setSaveSuppress(false);
@@ -629,21 +701,47 @@ void driveLoadSync(GameWorld* gw) {
                 coopLog("[load] FORCE-STREAM armed (test): join NACKs matching "
                         "saves to exercise the transfer");
         }
+        // A matched GO that arrived before the save subsystem was ready (title
+        // screen) is loaded here the moment it comes up. Its evaluation - and,
+        // on a miss, its NACK/transfer - already ran when it was received, so the
+        // wait for savesReady() never blocked the transfer path (title stall fix).
+        if (!g_loadReadyPending.empty() && coop::engine::savesReady()) {
+            std::string name = g_loadReadyPending;
+            g_loadReadyPending.clear();
+            char b[144];
+            _snprintf(b, sizeof(b) - 1,
+                      "[load] deferred MATCH ready -> loading '%s'", name.c_str());
+            b[sizeof(b) - 1] = '\0'; coopLog(b);
+            warnIfNoPortraits(name);
+            g_loadAfterCommit.clear();
+            coop::engine::setLoadBypassOnce();
+            if (!coop::engine::loadSave(name))
+                coopErr("[load] deferred coordinated load FAILED to issue");
+        }
 
         // LOAD_GOs: verify our on-disk copy and follow the host.
         std::deque<coop::InboundLoadGo> gos;
         g_inbound.drainLoadGos(gos);
         for (std::deque<coop::InboundLoadGo>::iterator it = gos.begin();
              it != gos.end(); ++it) {
-            if (it->pkt.loadId <= g_loadIdSeen) continue; // stale/duplicate
-            g_loadIdSeen = it->pkt.loadId;
+            if (it->pkt.loadId <= g_loadIdSeen) continue; // stale/duplicate (no disk I/O)
             char name[sizeof(it->pkt.name) + 1];
             memcpy(name, it->pkt.name, sizeof(it->pkt.name));
             name[sizeof(it->pkt.name)] = '\0';
             if (!name[0]) continue;
+            // Fingerprint our on-disk copy (filesystem only - never waits on the
+            // save subsystem) and pick the action. Evaluate BEFORE stamping
+            // g_loadIdSeen so the policy sees the pre-advance seen id.
             coop::u32 fp = coop::savexfer::folderFingerprint(name);
+            coop::sync::LoadGoAction act = coop::sync::decideLoadGo(
+                it->pkt.loadId, g_loadIdSeen, it->pkt.fingerprint, fp,
+                coop::engine::savesReady());
+            g_loadIdSeen = it->pkt.loadId; // handled this GO
             char b[192];
-            if (!s_forceStream && fp != 0 && fp == it->pkt.fingerprint) {
+            // FORCE_STREAM test bypass (ours): override a MATCH to the transfer
+            // path so a single-machine run still exercises the real folder xfer.
+            if (s_forceStream) act = coop::sync::LOADGO_NACK_TRANSFER;
+            if (act == coop::sync::LOADGO_LOAD_NOW) {
                 // Already in this exact save? A connect-triggered push (host
                 // bakes its current save and announces it) would otherwise
                 // reload the join into the world it is already in - a pointless
@@ -657,6 +755,7 @@ void driveLoadSync(GameWorld* gw) {
                     coop::engine::saveInfo(curp, sizeof(curp), 0, 0);
                     alreadyIn = (curp[0] && _stricmp(curp, name) == 0);
                 }
+                g_loadReadyPending.clear(); // this GO supersedes any deferred one
                 if (alreadyIn) {
                     _snprintf(b, sizeof(b) - 1,
                               "[load] GO id=%u name='%s' fp=%08x MATCH - already loaded, skip",
@@ -674,7 +773,18 @@ void driveLoadSync(GameWorld* gw) {
                     if (!coop::engine::loadSave(name))
                         coopErr("[load] coordinated load FAILED to issue");
                 }
-            } else {
+            } else if (act == coop::sync::LOADGO_DEFER_LOAD) {
+                // Match, but the save subsystem is not up yet (join still at the
+                // title menu). Latch and load once savesReady() flips - do NOT
+                // block here, and do NOT re-NACK a copy we actually have.
+                g_loadReadyPending = name;
+                g_loadAfterCommit.clear();
+                _snprintf(b, sizeof(b) - 1,
+                          "[load] GO id=%u name='%s' fp=%08x MATCH -> deferred (saves not ready)",
+                          it->pkt.loadId, name, fp);
+                b[sizeof(b) - 1] = '\0'; coopLog(b);
+            } else { // LOADGO_NACK_TRANSFER (missing/diverged) - never savesReady-gated
+                g_loadReadyPending.clear(); // a newer GO wants a transfer, not the old match
                 _snprintf(b, sizeof(b) - 1,
                           "[load] GO id=%u name='%s' hostFp=%08x localFp=%08x %s -> NACK (transfer)",
                           it->pkt.loadId, name, it->pkt.fingerprint, fp,
@@ -741,6 +851,7 @@ void coopPanelDrive(GameWorld* gw) {
     ps.peerPresent  = g_peerPresent;
     ps.isHost       = g_cfg.isHost;
     ps.transportSel = (g_cfg.transport == "steam") ? 0 : 1;
+    ps.showNametag  = g_cfg.showRemoteNametag;
     std::string detail;
     int ostate;
     if (g_peerPresent) {
@@ -781,11 +892,88 @@ void coopPanelDrive(GameWorld* gw) {
     ps.transferDetail = transfer.empty() ? (const char*)0 : transfer.c_str();
 
     // Still pump Steam callbacks so an inbound "Join Game" (a friend inviting
-    // US) can fire coopUiConnect; the outbound invite/picker UI is gone.
+    // US) can fire coopUiConnect; the outbound invite/picker UI is gone. Pumped
+    // BEFORE reading steaminvite::status() so the status we surface is fresh.
     coop::steaminvite::tick();
 
-    coop::engine::coopPanelTick(&ps, &coopUiConnect, &coopUiDisconnect);
-    coop::engine::coopOverlayTick(gw, detail.c_str(), ostate, g_net.isRunning());
+    // Surface the REAL connection error/status the lower layers already produce
+    // instead of only the generic Offline/Connecting/Connected text. Priority:
+    //   1. netUiError()  - a hard NET-thread reject (protocol/version mismatch);
+    //                      this is the failure that used to vanish into the log
+    //                      and leave the JOIN stuck on "Connecting..." -> "Offline".
+    //   2. steaminvite::status() - the Steam invite/lobby flow's own messages
+    //                      ("Version mismatch with host...", "Lobby creation
+    //                      failed...", "Connecting to host...") - already written,
+    //                      previously never consumed (orphaned getter).
+    //   3. the generic detail computed above.
+    // ostate (overlay colour) is left as-is: a hard reject drops the connection,
+    // so isRunning() goes false and the text shows in the Offline colour naturally.
+    const char* netErrMsg = coop::netUiError();          // "" unless a reject fired
+    const char* steamMsg  = coop::steaminvite::status(); // "" when idle
+    if (netErrMsg && netErrMsg[0]) {
+        detail = netErrMsg;
+    } else if (steamMsg && steamMsg[0]) {
+        detail = steamMsg;
+    }
+    ps.detail = detail.c_str();
+
+    // Remote-player nametag: resolve the co-op peer's Steam persona name and push
+    // it to the replicator so the peer's own driven bodies show WHOSE unit it is.
+    // Shown in NORMAL play now (the F2 "Show player names" toggle / showRemoteNametag
+    // config gates it), no longer only under KENSHICOOP_DEBUG_MARKERS. Steam
+    // transport only - a LAN/UDP session has no SteamID, so the label falls back to
+    // "[Remote Player]". personaName() caches and resolves asynchronously via the
+    // pump above, so this is cheap every tick and self-heals once info lands.
+    unsigned long long nametagPeer = (unsigned long long)coop::steamp2p::peerId();
+    if (nametagPeer == 0) nametagPeer = g_cfg.steamPeer;
+    const char* peerPersona = (g_cfg.transport == "steam" && nametagPeer != 0)
+        ? coop::steaminvite::personaName(nametagPeer) : "";
+    g_repl.setRemoteName(peerPersona);
+    // Push the visibility toggle each tick (the F2 button writes g_cfg via
+    // coopUiToggleNametag; the Replicator shows/hides the labels next tick).
+    g_repl.setShowNametag(g_cfg.showRemoteNametag);
+
+    // Panel now carries the nametag-toggle callback (4-arg signature from the
+    // steam-persona-nametag feature).
+    coop::engine::coopPanelTick(&ps, &coopUiConnect, &coopUiDisconnect,
+                                &coopUiToggleNametag);
+
+    // Auto-hide the persistent status banner once it has sat in the connected
+    // ("green", ostate == 2) state for a sustained window, so a stable session stops
+    // showing "Connected - peer joined" forever. Leaving green (peer disconnects,
+    // session drops, or a reconnect cycles back through the waiting state) reappears
+    // the banner instantly and re-arms the timer when green settles again. The
+    // decision lives in the pure, unit-tested StatusAutohide.h; here we just own the
+    // clock + the green-streak start tick. KENSHICOOP_STATUS_AUTOHIDE_MS overrides the
+    // 10 s default; 0 disables it (banner stays up = the pre-autohide behavior).
+    static int          s_autohideMs = -1;    // ms; -1 = unread, 0 = disabled
+    static unsigned long s_greenSince = 0;    // tick the green state began (0 = not green)
+    if (s_autohideMs < 0) {                   // read the env override once (matches autoRecruit)
+        const char* e = std::getenv("KENSHICOOP_STATUS_AUTOHIDE_MS");
+        s_autohideMs = e ? std::atoi(e) : (int)coop::STATUS_AUTOHIDE_MS;
+        if (s_autohideMs < 0) s_autohideMs = 0; // clamp junk negatives to "disabled"
+    }
+    unsigned long nowMs = GetTickCount();
+    if (ostate == 2) {                        // connected/green
+        if (s_greenSince == 0) s_greenSince = nowMs; // arm on the rising edge into green
+    } else {
+        s_greenSince = 0;                     // left green: disarm so the banner reappears
+    }
+    // Banner visibility now feeds the auto-hide decision (was g_net.isRunning() before
+    // the status-line-autohide feature); the overlay shows/hides on this flag.
+    bool showBanner = coop::statusOverlayShown(g_net.isRunning(), s_greenSince,
+                                               nowMs, (unsigned long)s_autohideMs);
+    coop::engine::coopOverlayTick(gw, detail.c_str(), ostate, showBanner);
+
+    // Ephemeral transition toast: a peer connect/leave edge armed it (armPeerToast);
+    // show it until TOAST_SHOW_MS elapses, then disarm so coopToastTick removes the
+    // label. Independent of the persistent overlay above (its own label + timer).
+    // Reuses nowMs (same tick instant as the auto-hide decision above) instead of a
+    // second GetTickCount() call.
+    bool toastShow = coop::engine::toastVisible(g_toastArmed, g_toastArmMs,
+                                                nowMs, coop::engine::TOAST_SHOW_MS);
+    if (g_toastArmed && !toastShow) g_toastArmed = false; // window elapsed: retire it
+    coop::engine::coopToastTick(gw, g_toastText.c_str(), g_toastState, toastShow);
 }
 
 // Main-thread tick hook: the one safe point where we touch game state.
@@ -1040,6 +1228,16 @@ void tickReplicatePublish(GameWorld* gw, bool worldLive) {
     }
     if (worldLive) {
         g_repl.publishOwned(gw, g_net, g_net.localId());
+        // Auto-revert (W1 non-gear pickup dupe mitigation): a NON-gear ground proxy is
+        // a real, pickable object; if a local character grabbed a peer's proxy, retaining
+        // it duplicates the authoring client's still-held real item (which mirrors back
+        // over the inventory channel below). Re-drop any picked-up proxy to the ground
+        // BEFORE publishInventories, so the pickup never becomes a published/persisted
+        // second copy. Gated on worldSync (proxies only exist when it is on). NOT pickup
+        // conservation (Phase W4) - the peer still cannot TAKE non-gear drops; the dupe
+        // is simply closed while the drop stays visible.
+        if (g_cfg.worldSync)
+            g_repl.revertProxyPickups(gw);
         // Both clients stream the contents of every squad member they OWN (host tab 0,
         // join tab 1) on content-change - bidirectional, disjoint by the same tab
         // partition as positional sync. Gated on invSync so ordinary co-op sessions add
@@ -1099,10 +1297,11 @@ void tickReplicatePublish(GameWorld* gw, bool worldLive) {
             g_repl.publishStats(gw, g_net, g_net.localId());
             g_repl.applyStats(gw, g_inbound);
         }
-        // Per-tab wallet sync (protocol 22): each client streams the money of
-        // the squad tabs it OWNS (change-gated reliable, keyed by tab rank);
-        // received snapshots land on the peer tabs via Ownerships::setMoney.
-        // Ordered after publishOwned (ownership ranks are the partition rule).
+        // Shared-wallet sync (protocol 22b): the player's real money is ONE
+        // per-faction wallet (Faction::factionOwnerships) shared by both co-op
+        // players, so each client publishes the DELTA of its own local change
+        // and the peer ADDS it - concurrent spends sum correctly. Reliable +
+        // ordered, so each delta applies exactly once (no safety resend).
         if (g_cfg.moneySync) {
             g_repl.publishMoney(replCtx(gw));
             g_repl.applyMoney(replCtx(gw));
@@ -1143,16 +1342,34 @@ void tickReplicatePublish(GameWorld* gw, bool worldLive) {
                 g_repl.publishStealth(gw, g_net, g_net.localId());
             g_repl.applyStealthFeedback(gw, g_inbound);
         }
-        // Consensus game-speed sync: detect local speed clicks as REQUESTS,
-        // host arbitrates effective = min(requests) (capped at 1x while either
-        // player squad fights) and broadcasts; the join applies the SET. Runs
-        // after publishOwned (the combat flag samples the ownHands_ set).
-        if (g_cfg.speedSync)
+        // Host-only game-speed/pause authority: detect local speed clicks, but
+        // only the HOST's request drives the effective (capped at 1x while
+        // either player squad fights); the join applies the host's SET and its
+        // own speed/pause input is reverted. Runs after publishOwned (the combat
+        // flag samples the ownHands_ set).
+        if (g_cfg.speedSync) {
             g_repl.syncSpeed(gw, g_inbound, g_net, g_net.localId(), g_cfg.isHost);
+            // A JOIN that tried to change speed/pause was denied and reverted -
+            // tell the player instead of silently swallowing the input. Consume
+            // the edge unconditionally (clears it); throttle the actual toast so
+            // a burst of clicks doesn't re-arm every frame.
+            if (!g_cfg.isHost) {
+                bool denied = g_repl.consumeSpeedDenied();
+                DWORD tnow = GetTickCount();
+                if (denied && (tnow - g_speedDenyToastMs) > SPEED_DENY_TOAST_COOLDOWN_MS) {
+                    armInfoToast("Only the host can change game speed", 0);
+                    g_speedDenyToastMs = tnow;
+                }
+            }
+        }
         // Phase 6 (6a evidence spike): env-gated ([shackledbg]) per-character
         // shackle/lock trace. No-op unless KENSHICOOP_DEBUG_SHACKLE=1, so it is
         // free to leave in the tick for manual-session characterization.
         coop::engine::shackleDbgTick(gw, g_cfg.isHost);
+        // Spike 59: env-gated ([bounty]) bounty/crime observer - direct reads
+        // of the Character+0xF0 inline BountyManager (sentinel-verified). No-op
+        // unless KENSHICOOP_BOUNTY_PROBE=1, so it is free to leave in the tick.
+        coop::engine::bountyProbeTick(gw, g_cfg.isHost);
         // Game-clock sync (protocol 25): the host broadcasts its absolute
         // in-game clock ~1 Hz; the join measures the offset and SLEWS - a
         // multiplier the speed layer's quiet writes fold in on top of the
@@ -1434,6 +1651,40 @@ void mainLoop_hook(GameWorld* gw, float dt) {
         }
     }
 
+    // Manual-validation helper (host only): KENSHICOOP_AUTOCRIME=N seconds -
+    // ONCE, N s after gameplay settles, programmatically assign a test bounty to
+    // a player-squad character (index = KENSHICOOP_AUTOCRIME_INDEX, default 1) via
+    // the engine's own unfairAddToBounty lever. On the host in inhabit mode a
+    // non-zero index is a JOIN-owned character's driven copy, so this reproduces
+    // the exact H2 witness-local state (a bounty on the host's copy of a join-owned
+    // PC) the protocol-45 channel must then carry to the owner - deterministic
+    // evidence without a hand-driven witnessed crime. OFF by default (0 = no-op).
+    if (g_cfg.isHost && g_gameStarted) {
+        static int  autoCrimeS    = -1;
+        static int  autoCrimeIdx  = -1;
+        static bool autoCrimeDone = false;
+        if (autoCrimeS < 0) {
+            const char* e = std::getenv("KENSHICOOP_AUTOCRIME");
+            autoCrimeS = e ? std::atoi(e) : 0;
+            const char* ei = std::getenv("KENSHICOOP_AUTOCRIME_INDEX");
+            autoCrimeIdx = ei ? std::atoi(ei) : 1;
+            if (autoCrimeIdx < 0) autoCrimeIdx = 1;
+        }
+        if (autoCrimeS > 0 && !autoCrimeDone &&
+            (GetTickCount() - g_gameStartTick) >= (DWORD)autoCrimeS * 1000u) {
+            autoCrimeDone = true;
+            unsigned int hand[5]; char sid[64];
+            bool ok = coop::engine::injectTestBounty(gw, (unsigned)autoCrimeIdx,
+                                                     500, hand, sid, sizeof(sid));
+            char b[192];
+            _snprintf(b, sizeof(b) - 1,
+                "[bounty] AUTOCRIME ok=%d idx=%d hand=%u,%u,%u,%u,%u fac='%s' amount=500",
+                ok ? 1 : 0, autoCrimeIdx, hand[0], hand[1], hand[2], hand[3], hand[4],
+                sid[0] ? sid : "-");
+            b[sizeof(b) - 1] = '\0'; coopLog(b);
+        }
+    }
+
     // Test-runner self-exit: quit cleanly after the configured duration so
     // unattended runs terminate on their own and flush their logs. Also a hard
     // backstop for a scenario that never reports completion.
@@ -1516,6 +1767,14 @@ void mainLoop_hook(GameWorld* gw, float dt) {
     // apply (its caches are now stale; the reset runs next tick's reload edge).
     tickReplicateApply(gw, worldLive);
 
+    // Cámara libre local (capturas / vídeo). POST-motor: el update() orbital ya
+    // corrió este frame, así que nuestra posición es la última que ve el renderer.
+    // Puramente local/visual (no red, no sync). Solo en sesiones interactivas
+    // (scenario vacío + sin test-seconds), igual que el panel F2, para no perturbar
+    // los oráculos del harness. El gate de config + la tecla van dentro.
+    if (g_cfg.scenario.empty() && g_cfg.testSeconds == 0)
+        coop::engine::freeCameraTick(gw, g_cfg.freeCamera);
+
     // Coordinated load deferred-signal backstop: if the LOADGAME signal stalls
     // past the grace window, pump SaveManager::execute() once from end-of-tick.
     tickLoadPumpBackstop(gw);
@@ -1567,13 +1826,16 @@ void titleUpdate_hook(TitleScreen* self) {
     // mainLoop_hook (gated on g_gameStarted). Pump the join half FIRST (before
     // the panel) so a GUI fault can never block it. gw is null: processNetEvents
     // only touches it under a gw&& guard, and the JOIN branches of driveSaveSync/
-    // driveLoadSync never deref it. The load path is gated on savesReady():
-    // before then the host's LOAD_GO simply waits in the inbound queue (no NACK
-    // -> no stream yet), and the save-receiver half still commits chunks to disk.
+    // driveLoadSync never deref it. driveLoadSync runs UNGATED here: evaluating
+    // the host's LOAD_GO (fingerprint the on-disk copy, and on a miss NACK to
+    // pull the transfer) is filesystem-only and must not wait on savesReady() -
+    // that wait once stranded the GO in the inbound queue for minutes while the
+    // player sat at the title screen. Only an immediate MATCH-load re-enters the
+    // engine, and driveLoadSync itself defers just that step until savesReady().
     if (g_net.isRunning() && !g_cfg.isHost && !g_gameStarted) {
         processNetEvents(0);
         if (g_cfg.saveSync) driveSaveSync();
-        if (g_cfg.loadSync && coop::engine::savesReady()) driveLoadSync(0);
+        if (g_cfg.loadSync) driveLoadSync(0);
         // F2 panel while the join waits at the menu (guarded; the host's world is
         // the destination, so we skip the config auto-load for a join session).
         coopPanelDriveSeh(0);
@@ -1696,6 +1958,16 @@ void coopUiConnect(bool isHost, bool useSteam, unsigned long long peerId) {
               g_cfg.ownRanksFromEnv ? "env" : "role");
     b[sizeof(b) - 1] = '\0';
     coopLog(b);
+
+    // Reset the transport selector before re-arming. startNetworking() only ever
+    // *sets* NetLink::steamPeer_ inside its transport=="steam" success branch; it
+    // never clears it. So when the same process switches Steam -> UDP, a stale
+    // steamPeer_ from the prior Steam attempt would survive and NetLink's
+    // `steam = (steamPeer_ != 0)` check would keep tunnelling over Steam even
+    // though the panel now says UDP. Clear it explicitly for the UDP path; the
+    // Steam path re-arms it with the current peer inside startNetworking().
+    if (!useSteam) g_net.setSteamTransport(0);
+
     startNetworking();
 }
 
@@ -1707,6 +1979,16 @@ void coopUiDisconnect() {
     // World stays live on a manual disconnect: despawn minted proxies before
     // clearing maps so nothing lingers as a duplicate or gets baked into a save.
     sessionResetForUi();
+}
+
+// F2 "Show player names" toggle -> flip the live config. Runtime-only: this is
+// NOT written back to coop_config.json (the whole panel is session-state, same as
+// the Role/Transport/pasted-peer choices). The Replicator reads showRemoteNametag
+// each tick via setShowNametag, so the change is immediate (no reconnect).
+void coopUiToggleNametag(bool show) {
+    g_cfg.showRemoteNametag = show;
+    coopLog(show ? "[coop-ui] show player names -> ON"
+                 : "[coop-ui] show player names -> OFF");
 }
 
 } // namespace
@@ -2015,6 +2297,7 @@ void installEngineDetours() {
     g_repl.setProdSync(g_cfg.prodSync);
     g_repl.setResearchSync(g_cfg.researchSync);
     g_repl.setWeatherSync(g_cfg.weatherSync);
+    g_repl.setBountySync(g_cfg.bountySync);
     // Protocol 34: the HOST authors every storage/machine container near the
     // interest centers (the ~1 Hz census inside publishInventories); the join
     // reconciles via the translated key. Host-only flag - the join must never

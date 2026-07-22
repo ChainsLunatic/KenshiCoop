@@ -25,6 +25,21 @@
 
 namespace coop {
 
+// --- Cross-thread connection-error channel (NET thread -> UI) ----------------
+// The NET thread rejects/aborts a connection for reasons a player must see
+// (protocol/version mismatch above all): before this channel those reasons only
+// reached the file log via netErr(), so a failed JOIN just sat on "Connecting..."
+// and then fell back to "Offline" with no explanation on screen. setNetUiError()
+// publishes a one-line human reason under an internal lock; the MAIN-thread F2
+// panel/overlay reads it each tick via netUiError() and shows it over the generic
+// status. clearNetUiError() is called when a fresh connect attempt starts so a
+// stale reason from a previous try never lingers. The buffer is guarded by a
+// CRITICAL_SECTION constructed at DLL load (before any net thread exists), so
+// every access is race-free.
+void        setNetUiError(const char* msg); // NET thread: publish a reject reason
+const char* netUiError();                   // MAIN thread: "" when none pending
+void        clearNetUiError();              // MAIN thread: wipe on a new attempt
+
 class NetLink {
 public:
     NetLink();
@@ -121,6 +136,9 @@ public:
     // MAIN thread: queue a reliable host-authoritative active-biome weather row
     // (protocol 46). Change-gated + safety-resent by the caller.
     void queueWeather(const WeatherPacket& pkt);
+    // MAIN thread: queue a reliable host-authoritative bounty/crime row
+    // (protocol 45). Change-gated + safety-resent by the caller (host only).
+    void queueBounty(const BountyPacket& pkt);
     void queueBuildPlace(const BuildPlacePacket& pkt);
     void queueBuildState(const BuildStatePacket& pkt);
     void queueBuildDoor(const BuildDoorPacket& pkt);
@@ -271,6 +289,8 @@ private:
     std::vector<ResearchPacket>  outResearch_;
     // Reliable active-biome weather rows (protocol 46). Guarded by outCs_.
     std::vector<WeatherPacket>   outWeather_;
+    // Reliable bounty/crime rows (protocol 45). Guarded by outCs_.
+    std::vector<BountyPacket>    outBounty_;
     std::vector<BuildPlacePacket> outBuildPlace_;
     std::vector<BuildStatePacket> outBuildState_;
     std::vector<BuildDoorPacket>  outBuildDoor_;

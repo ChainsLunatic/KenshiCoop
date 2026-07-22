@@ -24,6 +24,7 @@
 #include <windows.h>
 
 #include "../core/SteamId.h" // parseSteamId64 (pure) for the paste-from-clipboard button
+#include "../core/Config.h"  // saveLastPeer - persist the pasted friend ID for next launch
 
 namespace coop {
 namespace engine {
@@ -43,6 +44,7 @@ void markerColour(int colorId, MyGUI::Colour* col) {
     case 0:  *col = MyGUI::Colour(0.30f, 1.00f, 0.30f, 1.0f); break; // driven
     case 1:  *col = MyGUI::Colour(1.00f, 0.25f, 0.25f, 1.0f); break; // hidden
     case 2:  *col = MyGUI::Colour(1.00f, 0.90f, 0.25f, 1.0f); break; // local-only
+    case 4:  *col = MyGUI::Colour(0.55f, 0.85f, 1.00f, 1.0f); break; // player nametag (cyan)
     default: *col = MyGUI::Colour(0.80f, 0.80f, 0.80f, 1.0f); break;
     }
 }
@@ -206,6 +208,8 @@ struct CoopPanelUi {
     bool          connectedFlag; // desired connection state (Online/Offline toggle)
     bool          lastConnected; // last observed st->running (external-change sync)
     bool          lastChkVal;    // last toggle value (connect/disconnect edge)
+    bool          nametagFlag;   // desired "Show player names" state
+    bool          lastNametagVal;// last nametag value (toggle edge -> onToggleNametag)
     bool          needsRebuild;
     bool          f2Down;        // F2 held last tick (rising-edge toggle)
     std::string   lastStatus;    // last status text shown (refresh gate)
@@ -213,6 +217,7 @@ struct CoopPanelUi {
     CoopPanelUi()
         : panel(0), open(false), built(false), hostFlag(true), steamFlag(true),
           connectedFlag(false), lastConnected(false), lastChkVal(false),
+          nametagFlag(true), lastNametagVal(true),
           needsRebuild(false), f2Down(false) {}
 };
 
@@ -220,6 +225,7 @@ CoopPanelUi             g_panel;
 DataPanelLine_Button*   g_roleBtn      = 0;
 DataPanelLine_Button*   g_transBtn     = 0;
 DataPanelLine_Button*   g_connBtn      = 0; // Online/Offline toggle (replaces the checkbox)
+DataPanelLine_Button*   g_nametagBtn   = 0; // "Show player names" ON/OFF toggle
 DataPanelLine_Button*   g_copyIdBtn    = 0;
 DataPanelLine_Button*   g_pasteIdBtn   = 0; // "Paste friend's Steam ID" from clipboard
 DataPanelLine*          g_debugLine    = 0; // white connection-status debug row
@@ -227,10 +233,10 @@ DataPanelLine*          g_peerLine     = 0; // white "Friend's Steam ID" row
 DataPanelLine*          g_selfLine     = 0; // white "Your Steam ID" row
 std::string             g_selfIdStr;   // self SteamID as digits (set each tick; "" = none)
 
-// Friend's SteamID pasted in-panel this session (0 = none). Per-session by
-// design: it lives only in memory, so relaunching Kenshi clears it and the
-// friend's id is re-pasted (nothing is written to disk). Passed to onConnect,
-// where it overrides the (usually empty) config steamPeer.
+// Friend's SteamID pasted in-panel this session (0 = none). A valid paste is also
+// persisted to coop_last_peer.txt (see saveLastPeer) so the NEXT launch pre-fills
+// it as the default peer; within a session this in-memory value is still what wins
+// and is passed to onConnect, overriding the (usually empty) config steamPeer.
 unsigned long long      g_pastedPeer   = 0;
 bool                    g_pasteFailed  = false; // last paste wasn't a valid Steam ID
 
@@ -254,6 +260,16 @@ void onConnBtn(DataPanelLine*) {
     g_panel.needsRebuild = true;
     coop::logLine(g_panel.connectedFlag ? "[coop-ui] connection -> ONLINE"
                                         : "[coop-ui] connection -> OFFLINE");
+}
+// "Show player names" toggle: flip the desired nametag state. The edge
+// (nametagFlag vs lastNametagVal) is applied in coopPanelTick, which calls the
+// onToggleNametag callback so the plugin updates the live config (the Replicator
+// then shows/hides the floating names next tick - no reconnect needed).
+void onNametagBtn(DataPanelLine*) {
+    g_panel.nametagFlag = !g_panel.nametagFlag;
+    g_panel.needsRebuild = true;
+    coop::logLine(g_panel.nametagFlag ? "[coop-ui] nametags -> ON"
+                                      : "[coop-ui] nametags -> OFF");
 }
 // Copy the player's own SteamID to the clipboard so they can paste it to a friend
 // (who pastes it into their panel via "Paste friend's Steam ID").
@@ -279,6 +295,10 @@ void onPasteIdBtn(DataPanelLine*) {
     if (clipboardGetText(clip) && coop::parseSteamId64(clip, id)) {
         g_pastedPeer  = id;
         g_pasteFailed = false;
+        // Persist for next launch so a regular co-op pair never re-pastes (best-
+        // effort; a write failure only loses the convenience default, not this
+        // session's peer, which lives in g_pastedPeer above).
+        coop::saveLastPeer(id);
         char b[64];
         _snprintf(b, sizeof(b) - 1, "[coop-ui] paste friend id=%llu ok=1", id);
         b[sizeof(b) - 1] = '\0';
@@ -294,6 +314,7 @@ void onPasteIdBtn(DataPanelLine*) {
 struct PanelStrings {
     const std::string *title, *roleKey, *roleCap, *transKey, *transCap;
     const std::string *connKey, *connCap;
+    const std::string *nametagKey, *nametagCap;
     const std::string *dbgKey, *dbgVal;
     const std::string *peerKey, *peerVal, *pasteKey, *pasteCap;
     const std::string *selfKey, *selfVal, *copyKey, *copyCap;
@@ -307,6 +328,9 @@ void panelBuildSeh(DatapanelGUI* p, const PanelStrings* s) {
         g_roleBtn  = p->setLineButton(*s->roleKey,  *s->roleCap,  0);
         g_transBtn = p->setLineButton(*s->transKey, *s->transCap, 0);
         g_connBtn  = p->setLineButton(*s->connKey,  *s->connCap,  0);
+        // "Show player names" toggle: floating Steam-name labels over the peer's
+        // characters in normal play (independent of the debug-marker overlay).
+        g_nametagBtn = p->setLineButton(*s->nametagKey, *s->nametagCap, 0);
         p->addSpace(0, 0.35f);
         // Connection-status debug line (coloured white below, outside SEH).
         g_debugLine = p->setLine(*s->dbgKey, *s->dbgVal, *s->empty, 0, false, true);
@@ -362,7 +386,8 @@ void panelDestroySeh(ForgottenGUI* g, DatapanelGUI* p) {
 } // namespace
 
 void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
-                   CoopDisconnectFn onDisconnect) {
+                   CoopDisconnectFn onDisconnect,
+                   CoopNametagToggleFn onToggleNametag) {
     if (!st) return;
     ForgottenGUI* g = ::gui; // KenshiLib data export (spike 46)
     { static void* s_last = (void*)-1;
@@ -390,6 +415,8 @@ void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
             g_panel.connectedFlag = st->running;
             g_panel.lastConnected = st->running;
             g_panel.lastChkVal    = st->running;
+            g_panel.nametagFlag    = st->showNametag;
+            g_panel.lastNametagVal = st->showNametag;
             g_panel.open = true;
             g_panel.needsRebuild = true;
             coop::logLine("[coop-ui] panel opened");
@@ -397,7 +424,7 @@ void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
             panelDestroySeh(g, g_panel.panel);
             g_panel.panel = 0; g_panel.built = false;
             g_roleBtn = 0; g_transBtn = 0; g_connBtn = 0; g_copyIdBtn = 0;
-            g_pasteIdBtn = 0;
+            g_nametagBtn = 0; g_pasteIdBtn = 0;
             g_debugLine = 0; g_peerLine = 0; g_selfLine = 0;
             g_panel.open = false;
             coop::logLine("[coop-ui] panel closed");
@@ -451,6 +478,8 @@ void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
         std::string transCap = std::string("Transport: ") + (g_panel.steamFlag ? "STEAM" : "UDP") + "    (switch)";
         std::string connKey  = "conn";
         std::string connCap  = std::string("Connection: ") + (g_panel.connectedFlag ? "ONLINE" : "OFFLINE") + "    (switch)";
+        std::string nametagKey = "nametag";
+        std::string nametagCap = std::string("Show player names: ") + (g_panel.nametagFlag ? "ON" : "OFF") + "    (switch)";
 
         // White debug line: describes the live connection state + type. Reflects
         // the ACTUAL running session when online; the armed toggles when offline.
@@ -509,6 +538,7 @@ void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
         ps.title = &title; ps.roleKey = &roleKey; ps.roleCap = &roleCap;
         ps.transKey = &transKey; ps.transCap = &transCap;
         ps.connKey = &connKey; ps.connCap = &connCap;
+        ps.nametagKey = &nametagKey; ps.nametagCap = &nametagCap;
         ps.dbgKey = &dbgKey; ps.dbgVal = &dbgVal;
         ps.peerKey = &peerKey; ps.peerVal = &peerVal;
         ps.pasteKey = &pasteKey; ps.pasteCap = &pasteCap;
@@ -523,6 +553,7 @@ void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
         if (g_roleBtn)    g_roleBtn->callback    = MyGUI::newDelegate(&onRoleBtn);
         if (g_transBtn)   g_transBtn->callback   = MyGUI::newDelegate(&onTransBtn);
         if (g_connBtn)    g_connBtn->callback    = MyGUI::newDelegate(&onConnBtn);
+        if (g_nametagBtn) g_nametagBtn->callback = MyGUI::newDelegate(&onNametagBtn);
         if (g_copyIdBtn)  g_copyIdBtn->callback  = MyGUI::newDelegate(&onCopyIdBtn);
         if (g_pasteIdBtn) g_pasteIdBtn->callback = MyGUI::newDelegate(&onPasteIdBtn);
         dbgColourSeh(g_debugLine, !transfer.empty()); // amber while streaming
@@ -554,6 +585,14 @@ void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
             if (onDisconnect) onDisconnect();
         }
     }
+
+    // "Show player names" toggle edge (edge, not level): push the new state to the
+    // plugin so it updates the live config. Applies whether online or offline - the
+    // Replicator shows/hides the floating names on its next tick, no reconnect.
+    if (g_panel.nametagFlag != g_panel.lastNametagVal) {
+        g_panel.lastNametagVal = g_panel.nametagFlag;
+        if (onToggleNametag) onToggleNametag(g_panel.nametagFlag);
+    }
 }
 
 // ---- Persistent co-op status overlay ----------------------------------------
@@ -568,6 +607,14 @@ Character*   g_overlayLeader = 0;
 int          g_overlayState  = -1;
 std::string  g_overlayText;
 
+// Ephemeral toast label state (peer connect/disconnect transitions). A SEPARATE
+// ScreenLabel from the persistent overlay above, driven the same way but at a
+// higher head offset so both can show at once without overlapping.
+ScreenLabel* g_toast         = 0;
+Character*   g_toastLeader   = 0;
+int          g_toastState    = -1;
+std::string  g_toastText;
+
 int overlayColorId(int state) { return state == 2 ? 0 : (state == 1 ? 2 : 1); }
 
 Character* panelLeaderSeh(GameWorld* gw) {
@@ -577,35 +624,56 @@ Character* panelLeaderSeh(GameWorld* gw) {
         return gw->player->playerCharacters[0];
     } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
 }
-} // namespace
 
-void coopOverlayTick(GameWorld* gw, const char* text, int state, bool show) {
-    ForgottenGUI* g = ::gui;
-    if (!g) return;
-
+// Shared driver for one leader-tracked ScreenLabel (the persistent overlay OR the
+// ephemeral toast). The label/leader/state/text statics are passed IN by pointer
+// so the two banners stay fully independent labels sharing this create-once /
+// update-in-place / destroy-on-hide lifecycle (the spike-47/48 render path via the
+// marker* SEH shims). offY is the head-height offset that separates the two.
+void trackedLabelTick(ForgottenGUI* g, GameWorld* gw, const char* text, int state,
+                      bool show, float offY, ScreenLabel** label,
+                      Character** leaderSlot, int* stateSlot, std::string* textSlot) {
     Character* leader = show ? panelLeaderSeh(gw) : 0;
     if (!show || !leader) {
-        if (g_overlay) {
-            markerDestroySeh(g, g_overlay);
-            g_overlay = 0; g_overlayLeader = 0; g_overlayState = -1; g_overlayText.clear();
+        if (*label) {
+            markerDestroySeh(g, *label);
+            *label = 0; *leaderSlot = 0; *stateSlot = -1; textSlot->clear();
         }
         return;
     }
 
     std::string t = text ? std::string(text) : std::string();
-    if (!g_overlay || leader != g_overlayLeader) {
-        if (g_overlay) markerDestroySeh(g, g_overlay);
+    if (!*label || leader != *leaderSlot) {
+        if (*label) markerDestroySeh(g, *label);
         MyGUI::Colour col; markerColour(overlayColorId(state), &col);
-        Ogre::Vector3 off(0.0f, 2.8f, 0.0f);
-        g_overlay = markerCreateSeh(g, leader, &t, &col, &off);
-        g_overlayLeader = leader; g_overlayState = state; g_overlayText = t;
+        Ogre::Vector3 off(0.0f, offY, 0.0f);
+        *label = markerCreateSeh(g, leader, &t, &col, &off);
+        *leaderSlot = leader; *stateSlot = state; *textSlot = t;
         return;
     }
-    if (t != g_overlayText || state != g_overlayState) {
+    if (t != *textSlot || state != *stateSlot) {
         MyGUI::Colour col; markerColour(overlayColorId(state), &col);
-        markerUpdateSeh(g_overlay, &t, &col);
-        g_overlayText = t; g_overlayState = state;
+        markerUpdateSeh(*label, &t, &col);
+        *textSlot = t; *stateSlot = state;
     }
+}
+} // namespace
+
+void coopOverlayTick(GameWorld* gw, const char* text, int state, bool show) {
+    ForgottenGUI* g = ::gui;
+    if (!g) return;
+    // Persistent status banner: pinned at head height 2.8 (spike-47 render offset).
+    trackedLabelTick(g, gw, text, state, show, 2.8f,
+                     &g_overlay, &g_overlayLeader, &g_overlayState, &g_overlayText);
+}
+
+void coopToastTick(GameWorld* gw, const char* text, int state, bool show) {
+    ForgottenGUI* g = ::gui;
+    if (!g) return;
+    // Ephemeral transition toast: sits at 3.4, just ABOVE the persistent overlay,
+    // so a "Peer connected/disconnected" pop never overlaps the status banner.
+    trackedLabelTick(g, gw, text, state, show, 3.4f,
+                     &g_toast, &g_toastLeader, &g_toastState, &g_toastText);
 }
 
 } // namespace engine

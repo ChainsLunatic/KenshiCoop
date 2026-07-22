@@ -87,6 +87,20 @@
 
     Scenarios = @{
         # ---- entity stream / presence -------------------------------------------
+        # stop_probe: diagnostic repro for on-stop overshoot/rubberband in the driven
+        # copy (walk-drive taper + halting-settle fix, concept from CTRL-ALT-E e36b960).
+        # Host walks its squad leader out-and-back on squad1 with a REAL halt at each
+        # end (move issued once per leg), for a long window so a heavy-modlist join
+        # still overlaps many stops. Read the join [drv] trace (KENSHICOOP_DRIVEDBG=1)
+        # at the stops. Not tiered (never runs in regress); smoothness/crosscheck
+        # advisory only.
+        stop_probe = @{
+            Save = 'squad1'; Setup = ''; Tolerance = 3.0
+            PrimaryGate = 'crosscheck'
+            Gating   = @('crosscheck')
+            Advisory = @('smoothness', 'anim_truth', 'march', 'clock_sync')
+            Tier = 'none'; WanVariant = $false
+        }
         leader_move = @{
             Save = 'sync'; Setup = ''; Tolerance = 3.0
             PrimaryGate = 'crosscheck'
@@ -1037,6 +1051,22 @@
             Tier = 'full'; WanVariant = $false
         }
 
+        # prod_sync_join: MISMO script que prod_sync pero conduce el JOIN (coloca
+        # + opera el banco de crafteo); el host observa. Prueba la AUTORIDAD
+        # POR-OBJETO del protocolo 33: una maquina placed la conduce quien la
+        # coloco, asi que el JOIN debe poder craftear y el HOST verlo sin
+        # revertirlo. El oraculo (Test-ProdSyncJoin) es el espejo de prod_sync
+        # con los roles host/join intercambiados: gate que el JOIN coloco+envio
+        # [prod] rows, el HOST los recibio+aplico, y el banco minteado en el host
+        # convergio al outAmt operado por el join (gap <= 1.0).
+        prod_sync_join = @{
+            Save = 'sync'; Setup = ''; Tolerance = 6.0
+            PrimaryGate = 'prod_sync_join'
+            Gating   = @('prod_sync_join', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'full'; WanVariant = $false
+        }
+
         # research_probe: tech-tree phase-0 diagnostic (protocol 38 -
         # researchSync forced OFF). Both sides pick the deterministic
         # not-known-researchable RESEARCH subject at t=8s and poll
@@ -1491,6 +1521,25 @@
             Save = 'squad1'; Setup = ''; Tolerance = 3.0
             PrimaryGate = 'wi_join'
             Gating   = @('wi_join', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'full'; WanVariant = $false
+        }
+        # world_item_peer_pickup: NON-gear ground-item cross-client PICKUP
+        # conservation. The HOST drops a common non-gear item (W1 proxy); the JOIN
+        # picks that proxy up into its own rank-1 bag. On the unfixed W1 path the
+        # host keeps its real ground item AND gains the join's mirrored copy -> a
+        # silent DUPE (host total=2). The auto-revert mitigation re-drops any
+        # picked-up proxy before the inventory publish so total stays 1. Gate =
+        # host maxtot<=1 AND fintot==1, with drop+pickup actually exercised.
+        world_item_peer_pickup = @{
+            # invSync = the join's pickup must mirror to the host (the dupe channel);
+            # worldSync = the W1 proxy path + the revertProxyPickups mitigation are both
+            # gated on it. Named-scenario auto-enable was retired upstream in favour of
+            # this per-scenario DiagEnv, matching world_weapon_drop/world_armor_drop.
+            DiagEnv = @{ KENSHICOOP_INV_SYNC = '1'; KENSHICOOP_WORLD_SYNC = '1'; KENSHICOOP_INV_DUMP = '1' }
+            Save = 'squad1'; Setup = ''; Tolerance = 3.0
+            PrimaryGate = 'wi_peer_pickup'
+            Gating   = @('wi_peer_pickup', 'clock_sync')
             Advisory = @('smoothness', 'anim_truth', 'march')
             Tier = 'full'; WanVariant = $false
         }

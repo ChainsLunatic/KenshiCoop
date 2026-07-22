@@ -2,6 +2,7 @@
 
 #include "Config.h"
 #include "OwnRanks.h"
+#include "SteamId.h" // parseSteamId64 (pure) - re-validates the persisted last-peer file
 #include <cstdlib>
 #include <cstdio>
 #include <map>
@@ -70,16 +71,30 @@ std::map<std::string, std::string> parseFlatJson(const std::string& text) {
     return m;
 }
 
-// Absolute path to coop_config.json next to KenshiCoop.dll (fallback: cwd).
-std::string configFilePath() {
+// Directory that holds KenshiCoop.dll, with a trailing slash (fallback: cwd = "").
+// Both the config file and its sibling last-peer file live here.
+std::string moduleDirPath() {
     char buf[MAX_PATH];
     HMODULE h = GetModuleHandleA("KenshiCoop.dll");
     DWORD n = GetModuleFileNameA(h, buf, MAX_PATH); // h == 0 would give the exe path
-    if (h == 0 || n == 0 || n >= MAX_PATH) return "coop_config.json";
+    if (h == 0 || n == 0 || n >= MAX_PATH) return std::string();
     std::string p(buf, n);
     size_t slash = p.find_last_of("\\/");
-    p = (slash != std::string::npos) ? p.substr(0, slash + 1) : std::string();
-    return p + "coop_config.json";
+    return (slash != std::string::npos) ? p.substr(0, slash + 1) : std::string();
+}
+
+// Absolute path to coop_config.json next to KenshiCoop.dll (fallback: cwd).
+std::string configFilePath() {
+    return moduleDirPath() + "coop_config.json";
+}
+
+// Absolute path to the sibling last-peer file (coop_last_peer.txt) next to
+// coop_config.json / the DLL. This is the tiny convenience store for the friend
+// SteamID last pasted in the F2 panel - kept OUT of coop_config.json so the
+// hand-authored config (with its // comments, which our flat parser would strip
+// on a rewrite) is never clobbered.
+std::string lastPeerFilePath() {
+    return moduleDirPath() + "coop_last_peer.txt";
 }
 
 std::map<std::string, std::string> readConfigFile() {
@@ -231,7 +246,19 @@ void loadConfig(Config& c) {
     c.prodSync    = envOr("KENSHICOOP_PROD_SYNC", "1") != "0";
     c.researchSync = envOr("KENSHICOOP_RESEARCH_SYNC", "1") != "0";
     c.weatherSync = envOr("KENSHICOOP_WEATHER_SYNC", "1") != "0";
+    c.bountySync = envOr("KENSHICOOP_BOUNTY_SYNC", "1") != "0";
+    // The bounty channel (protocol 45) coexists with the read-only spike-59
+    // probe (KENSHICOOP_BOUNTY_PROBE): the probe only READS, so both can run,
+    // but keep the write channel OFF while probing the unsynced baseline.
+    if (envOr("KENSHICOOP_BOUNTY_PROBE", "0") == "1") c.bountySync = false;
+
     c.storeSync   = envOr("KENSHICOOP_STORE_SYNC", "1") != "0";
+
+    // Remote-player nametag: normal-play name label over the peer's driven
+    // bodies. DEFAULT ON (Zero wants it visible by default); the F2 panel
+    // "Show player names" toggle flips it live. "0" starts hidden.
+    c.showRemoteNametag = envOr("KENSHICOOP_SHOW_NAMETAG", "1") != "0";
+
     c.squadSync   = envOr("KENSHICOOP_SQUAD_SYNC", "1") != "0";
     c.latejoinSync = envOr("KENSHICOOP_LATEJOIN_SYNC", "1") != "0";
     // NOTE: every channel above DEFAULTS ON for real sessions; the diagnostic
@@ -248,7 +275,18 @@ void loadConfig(Config& c) {
     c.transport = envOr("KENSHICOOP_TRANSPORT", fileOr(f, "transport", "udp").c_str());
     c.steamPeer = (unsigned long long)_strtoui64(
         envOr("KENSHICOOP_STEAM_PEER", fileOr(f, "steamPeer", "0").c_str()).c_str(), 0, 10);
+    // Lowest-precedence default: if neither the env var nor coop_config.json set a
+    // peer (the normal panel-driven install ships steamPeer unset), fall back to the
+    // friend SteamID last pasted in the F2 panel (persisted in coop_last_peer.txt).
+    // This flows through to CoopPanelState::peerSteamId, so the panel opens with the
+    // last friend's ID pre-filled; the player can still paste a different one to play
+    // with someone else that session. Precedence stays env > file > last-pasted.
+    if (c.steamPeer == 0) c.steamPeer = loadLastPeer();
     c.steamPing = (unsigned long long)_strtoui64(envOr("KENSHICOOP_STEAM_PING", "0").c_str(), 0, 10);
+
+    // Cámara libre local (feature de capturas/vídeo). DEFAULT ON; "0" la
+    // deshabilita. Es puramente local/visual: no hay wire, no hay sync.
+    c.freeCamera = envOr("KENSHICOOP_FREE_CAMERA", "1") != "0";
 
     // In-game panel session control: opt-in legacy auto-start. Default OFF so a
     // panel-driven (env-free) install defers the session to the Connect button;
@@ -276,7 +314,13 @@ void loadConfig(Config& c) {
         f = std::atof(envOr("KENSHICOOP_INTERP_SNAP_DIST", "0").c_str());
         c.interpSnapDist = (f > 0.0) ? (float)f : 50.0f;
         f = std::atof(envOr("KENSHICOOP_CATCHUP_K", "0").c_str());
-        c.catchupK = (f > 0.0) ? (float)f : 2.0f;
+        // Default lowered 2.0 -> 1.4 (midpoint of the 1.3-1.5 band under trial)
+        // to soften the remote-body gap catch-up boost blamed for the "fast
+        // camera"/lag feel in live play. Still env-overridable (a positive
+        // KENSHICOOP_CATCHUP_K wins); this only moves the fallback. NOTE: this is
+        // a starting-point change pending "by feel" validation in a live session,
+        // not a confirmed fix for the lag.
+        c.catchupK = (f > 0.0) ? (float)f : 1.4f;
         f = std::atof(envOr("KENSHICOOP_SNAP_DIST", "0").c_str());
         c.snapDist = (f > 0.0) ? (float)f : 8.0f;
         f = std::atof(envOr("KENSHICOOP_SNAP_SECONDS", "0").c_str());
@@ -371,7 +415,7 @@ std::string describeConfig(const Config& c) {
         { "store",   c.storeSync },    { "squad",   c.squadSync },
         { "latejoin",c.latejoinSync }, { "aiSuspend", c.aiSuspend },
         { "gateAuth",c.gateAuthority },{ "camInterest", c.camInterest },
-        { "censusFreezeAi", c.censusFreezeAi },
+        { "censusFreezeAi", c.censusFreezeAi }, { "freeCam", c.freeCamera },
     };
     s += " on=[";
     bool first = true;
@@ -414,6 +458,31 @@ void reloadPeerFromFile(Config& c) {
     if (it != f.end() && !it->second.empty()) c.ip = it->second;
     it = f.find("port");
     if (it != f.end() && !it->second.empty()) c.port = std::atoi(it->second.c_str());
+}
+
+void saveLastPeer(unsigned long long id) {
+    // Persist the friend SteamID last pasted in the F2 panel so a regular co-op
+    // pair does not have to re-paste each other's IDs on every launch. Best-effort:
+    // a failed open is silently ignored (this is only a convenience default). id 0
+    // is a no-op - we never persist "no peer".
+    if (id == 0) return;
+    std::ofstream f(lastPeerFilePath().c_str(), std::ios::binary | std::ios::trunc);
+    if (!f) return;
+    char b[32];
+    _snprintf(b, sizeof(b) - 1, "%llu\n", id);
+    b[sizeof(b) - 1] = '\0';
+    f << b;
+}
+
+unsigned long long loadLastPeer() {
+    // Read the persisted last-peer SteamID (0 if the file is missing/unreadable or
+    // its contents are not a valid SteamID64). Re-validating through parseSteamId64
+    // means a corrupted/edited file can never inject a bogus peer.
+    std::ifstream f(lastPeerFilePath().c_str(), std::ios::binary);
+    if (!f) return 0;
+    std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    unsigned long long id = 0;
+    return parseSteamId64(text, id) ? id : 0;
 }
 
 } // namespace coop

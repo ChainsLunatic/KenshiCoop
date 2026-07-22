@@ -5,7 +5,8 @@ REM (VC++ 2010) x64 compiler as the plugin so the packed-struct layout under
 REM test is EXACTLY the layout the shipped DLL compiles (that is the point:
 REM prototest locks the wire contract of this toolchain).
 REM
-REM No game/KenshiLib/ENet dependencies - just the CRT.
+REM No game/KenshiLib/ENet dependencies - just the CRT (+ Win32 for Config.cpp's
+REM last-peer file, which resolves next to the module = cwd in this test exe).
 setlocal
 
 set "REPO=%~dp0.."
@@ -16,9 +17,12 @@ popd >nul
 set "VS10=C:\Program Files (x86)\Microsoft Visual Studio 10.0"
 set "VC=%VS10%\VC"
 set "SDK=C:\Program Files\Microsoft SDKs\Windows\v7.1"
+REM enet headers are needed only to PARSE net\NetLink.h (SaveXfer.cpp includes it);
+REM the queue* sinks it references are stubbed in savexfer_test.cpp (no ENet link).
+set "ENET=%REPO%\third_party\enet\enet\include"
 
 set "PATH=%VC%\bin\amd64;%VC%\bin;%VS10%\Common7\IDE;%SDK%\Bin\x64;%SDK%\Bin;%PATH%"
-set "INCLUDE=%VC%\include;%SDK%\Include;%REPO%\third_party\vc10_compat"
+set "INCLUDE=%VC%\include;%SDK%\Include;%REPO%\third_party\vc10_compat;%ENET%"
 set "LIB=%VC%\lib\amd64;%SDK%\Lib\x64"
 
 if not exist "%REPO%\dist" mkdir "%REPO%\dist"
@@ -28,13 +32,16 @@ echo === Building prototest.exe (Release^|x64, v100) ===
 REM KENSHICOOP_PROTOTEST keeps SaveXfer.cpp CRT-only (its NetLink/engine-coupled
 REM sender + quiescence watch are #ifdef'd out) so the real save-transfer RECEIVER
 REM (onSaveBegin/onSaveFile/onSaveDone -> stage/verify/commit) can be exercised
-REM end-to-end here without pulling in ENet/KenshiLib.
-cl.exe /nologo /O2 /EHsc /W3 /D KENSHICOOP_PROTOTEST ^
+REM end-to-end here without pulling in ENet/KenshiLib. savexfer_test.cpp adds the
+REM receiver data-safety coverage (zeroit789 merge) + provides the logLine stubs.
+cl.exe /nologo /O2 /EHsc /W3 /D KENSHICOOP_PROTOTEST /DWIN32_LEAN_AND_MEAN ^
     /Fo"%REPO%\build\prototest\\" ^
     /Fe"%REPO%\dist\prototest.exe" ^
     "%REPO%\src\prototest\main.cpp" ^
+    "%REPO%\src\prototest\savexfer_test.cpp" ^
+    "%REPO%\src\plugin\sync\SaveXfer.cpp" ^
     "%REPO%\src\plugin\sync\Interp.cpp" ^
-    "%REPO%\src\plugin\sync\SaveXfer.cpp"
+    "%REPO%\src\plugin\core\Config.cpp"
 if errorlevel 1 (
     echo prototest build FAILED
     exit /b 1

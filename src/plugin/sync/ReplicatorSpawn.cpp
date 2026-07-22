@@ -650,6 +650,12 @@ void Replicator::applyEvents(GameWorld* gw, Inbound& in) {
                                        ev.aIndex, ev.aSerial };
                 int kind = (int)ev.arg;
                 bool ok = occ && engine::applyFurniture(0, occ, fh, kind, true);
+                // Spike 58 (kind-conflict anchor): remember the reliable-edge
+                // kind on the driven record, so a CHAINED-only continuous bit
+                // can't break an edge-vouched cage/bed (chainAnchorStep).
+                // Same targets_ seeding pattern as the deathLatched carry.
+                if (ownHands_.find(k) == ownHands_.end())
+                    targets_[k].furnEdgeKind = kind;
                 char fb[160]; _snprintf(fb, sizeof(fb) - 1,
                     "[furn] RECV ENTER id=%u occ=%u,%u furn=%u,%u kind=%d ok=%d",
                     ev.eventId, ev.sIndex, ev.sSerial, ev.aIndex, ev.aSerial,
@@ -667,6 +673,13 @@ void Replicator::applyEvents(GameWorld* gw, Inbound& in) {
                                        ev.aIndex, ev.aSerial };
                 int kind = (int)ev.arg;
                 bool ok = occ && engine::applyFurniture(0, occ, fh, kind, false);
+                // Spike 58: the reliable EXIT withdraws the vouch (find, not
+                // operator[] - an exit for a never-seen body must not seed a
+                // junk driven record).
+                {
+                    std::map<Key, Driven>::iterator dt = targets_.find(k);
+                    if (dt != targets_.end()) dt->second.furnEdgeKind = 0;
+                }
                 char fb[160]; _snprintf(fb, sizeof(fb) - 1,
                     "[furn] RECV EXIT id=%u occ=%u,%u furn=%u,%u kind=%d ok=%d",
                     ev.eventId, ev.sIndex, ev.sSerial, ev.aIndex, ev.aSerial,
@@ -736,6 +749,14 @@ void Replicator::rekeyPeerBody(GameWorld* gw, const Key& oldK, const Key& newK,
     // which lands on the SAME new hand (run 120738) - would otherwise
     // silence our own edge's stream.
     if (pinOwned_.count(newK) || ownHands_.count(newK)) return;
+    // Author-release echo (gap 10 cross-tab control-release): a hand we
+    // ALREADY pinned peer is either our own release of a unit we moved into
+    // the peer's tab (publishSquadMoves) or a re-key this side already
+    // processed - classification and membership are settled, and the body
+    // (when local) is driven by direct hand resolution. Re-entering would
+    // fail the oldK resolve (our copy already re-containered away from it)
+    // and enroll a force-REQ whose reply can only dupe-defer forever - skip.
+    if (pinPeer_.count(newK)) return;
     // Phase 1b (control follows the squad transfer): does newK's destination tab
     // resolve to a rank THIS client owns? Uses the SAME predicate publishOwned
     // partitions on (ownRanks_ over the latched tabRank_). When true, the move
@@ -776,12 +797,20 @@ void Replicator::rekeyPeerBody(GameWorld* gw, const Key& oldK, const Key& newK,
     // EVT_SQUAD_MOVE re-keyed it and un-pinned the body). Snapshot the latches
     // here and re-seed them onto targets_[newK] so the corpse stays down.
     bool carryDeath = false, carryKo = false, carryDown = false;
+    // Carry the furniture-edge vouch too: a caged+shackled prisoner whose
+    // hand re-keys mid-occupancy (recruit / squad move) would otherwise get a
+    // fresh Driven with furnEdgeKind=0, and the very next kind-3 tick reads
+    // CHAIN_ANCHOR_RECHAIN instead of HOLD (chainAnchorStep) - one 75-885 u
+    // re-seat teleport, exactly what the jail-anchor fix suppresses. The
+    // vouch is a reliable-edge fact about the BODY, not the hand.
+    int carryFurnKind = 0;
     {
         std::map<Key, Driven>::iterator oldT = targets_.find(oldK);
         if (oldT != targets_.end()) {
-            carryDeath = oldT->second.deathLatched;
-            carryKo    = oldT->second.koLatched;
-            carryDown  = oldT->second.downApplied;
+            carryDeath    = oldT->second.deathLatched;
+            carryKo       = oldT->second.koLatched;
+            carryDown     = oldT->second.downApplied;
+            carryFurnKind = oldT->second.furnEdgeKind;
         }
     }
     // Drop the old key's stream state too (run 192211: the interp TAIL of a
@@ -805,6 +834,17 @@ void Replicator::rekeyPeerBody(GameWorld* gw, const Key& oldK, const Key& newK,
             newK.t, newK.c, newK.cs, newK.i, newK.s,
             carryDeath ? 1 : 0, carryKo ? 1 : 0);
         lb[sizeof(lb) - 1] = '\0'; coop::logLine(lb);
+    }
+    if (carryFurnKind != 0) {
+        Driven& nd = targets_[newK]; // stream fills interp; we seed only the vouch
+        // A RECV ENTER already stamped under the NEW hand is fresher than the
+        // migrated vouch - keep it and only fill the empty slot.
+        if (nd.furnEdgeKind == 0) nd.furnEdgeKind = carryFurnKind;
+        char fb[200]; _snprintf(fb, sizeof(fb) - 1,
+            "[event] REKEY-FURN old=%u,%u,%u,%u,%u new=%u,%u,%u,%u,%u kind=%d",
+            oldK.t, oldK.c, oldK.cs, oldK.i, oldK.s,
+            newK.t, newK.c, newK.cs, newK.i, newK.s, nd.furnEdgeKind);
+        fb[sizeof(fb) - 1] = '\0'; coop::logLine(fb);
     }
     Character* c = engine::resolveCharByHand(oldK.i, oldK.s, oldK.t, oldK.c, oldK.cs);
     if (!c) {
