@@ -110,6 +110,22 @@
             Tier = 'smoke'; WanVariant = $true
         }
 
+        # weather_sync (protocol 46 weather v2): both clients load squad1 so they
+        # share one weather region/season. weather_hook is the PrimaryGate (proves
+        # the setupWeather detour installed on BOTH clients - always has signal);
+        # weather_sync judges host->join agreement (season+sid+duration per seq) IF
+        # a transition fires in the window. Weather changes on game-hours, so a
+        # short run usually SKIPs the sync gate (no signal, tolerated). Tier 'none'
+        # = runs only when explicitly named (-Scenario weather_sync) until a forcing
+        # setup scene makes an in-window transition deterministic.
+        weather_sync = @{
+            Save = 'squad1'; Setup = ''; Tolerance = 3.0
+            PrimaryGate = 'weather_hook'
+            Gating   = @('weather_hook', 'weather_sync')
+            Advisory = @('clock_sync')
+            Tier = 'none'; WanVariant = $false
+        }
+
         # split_interest (step 5): the host's tab leaves the bar; bar NPCs must keep
         # streaming via the second interest sphere (the join's tab leader). The join
         # walks nothing - its member IS the remote anchor. Save 'sync' (the bar
