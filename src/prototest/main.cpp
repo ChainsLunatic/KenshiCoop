@@ -90,7 +90,7 @@ static void testSizes() {
     CHECK_EQ("sizeof(MedPartEntry)",            sizeof(MedPartEntry),            19);
     CHECK_EQ("sizeof(MedicalPacket)",           sizeof(MedicalPacket),           467);
     CHECK_EQ("sizeof(TreatmentPacket)",         sizeof(TreatmentPacket),         77);
-    CHECK_EQ("sizeof(CombatHitPacket)",         sizeof(CombatHitPacket),         37);
+    CHECK_EQ("sizeof(CombatHitPacket)",         sizeof(CombatHitPacket),         42);
     CHECK_EQ("sizeof(SpeedPacket)",             sizeof(SpeedPacket),             14);
     CHECK_EQ("sizeof(StatsPacket)",             sizeof(StatsPacket),             194);
     CHECK_EQ("sizeof(StealthPacket)",           sizeof(StealthPacket),           427);
@@ -221,7 +221,8 @@ static void testSizes() {
     CHECK_EQ("EVT_SQUAD_MOVE id", (int)EVT_SQUAD_MOVE, 11);
     CHECK("EVT_SQUAD_MOVE distinct", EVT_SQUAD_MOVE != EVT_RECRUIT &&
           EVT_SQUAD_MOVE != EVT_NONE && EVT_SQUAD_MOVE != EVT_EXIT_FURNITURE);
-    CHECK_EQ("PROTOCOL_VERSION (v46: parent-relative nested inventory)", (int)PROTOCOL_VERSION, 46);
+    CHECK_EQ("COMBAT_HIT_KNOCKOUT flag", (int)COMBAT_HIT_KNOCKOUT, 1);
+    CHECK_EQ("PROTOCOL_VERSION (v47: join assassination report + KO skill)", (int)PROTOCOL_VERSION, 47);
 }
 
 // ---- 2. readPacket / packetType round-trips -----------------------------------
