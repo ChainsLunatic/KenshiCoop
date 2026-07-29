@@ -101,7 +101,7 @@ static void testSizes() {
     CHECK_EQ("sizeof(MedPartEntry)",            sizeof(MedPartEntry),            19);
     CHECK_EQ("sizeof(MedicalPacket)",           sizeof(MedicalPacket),           467);
     CHECK_EQ("sizeof(TreatmentPacket)",         sizeof(TreatmentPacket),         77);
-    CHECK_EQ("sizeof(CombatHitPacket)",         sizeof(CombatHitPacket),         37);
+    CHECK_EQ("sizeof(CombatHitPacket)",         sizeof(CombatHitPacket),         42);
     CHECK_EQ("sizeof(SpeedPacket)",             sizeof(SpeedPacket),             14);
     CHECK_EQ("sizeof(StatsPacket)",             sizeof(StatsPacket),             198);
     CHECK_EQ("sizeof(StealthPacket)",           sizeof(StealthPacket),           427);
@@ -234,7 +234,10 @@ static void testSizes() {
     CHECK_EQ("EVT_SQUAD_MOVE id", (int)EVT_SQUAD_MOVE, 11);
     CHECK("EVT_SQUAD_MOVE distinct", EVT_SQUAD_MOVE != EVT_RECRUIT &&
           EVT_SQUAD_MOVE != EVT_NONE && EVT_SQUAD_MOVE != EVT_EXIT_FURNITURE);
-    CHECK_EQ("PROTOCOL_VERSION (v46: name + animal age + weather sync; local merge adds bounty at PKT_BOUNTY=44 and parent-relative nested inventory, version kept 46)", (int)PROTOCOL_VERSION, 46);
+    CHECK_EQ("COMBAT_HIT_KNOCKOUT flag", (int)COMBAT_HIT_KNOCKOUT, 1);
+    // v47 local merge set: name + animal age + weather sync, bounty at
+    // PKT_BOUNTY=44, parent-relative nested inventory, join assassination report.
+    CHECK_EQ("PROTOCOL_VERSION (v47 local merge set)", (int)PROTOCOL_VERSION, 47);
 }
 
 // ---- 2. readPacket / packetType round-trips -----------------------------------
