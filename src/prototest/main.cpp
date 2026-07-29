@@ -89,7 +89,8 @@ static void testSizes() {
     CHECK_EQ("sizeof(EntityState)",             sizeof(EntityState),             79);
     CHECK_EQ("sizeof(EntityBatchHeader)",       sizeof(EntityBatchHeader),       14); // v35: +sendMs; v44: +epoch
     CHECK_EQ("sizeof(InvItemEntry)",            sizeof(InvItemEntry),            158); // v42: +locked+lockReserved
-    CHECK_EQ("sizeof(InvSnapshotHeader)",       sizeof(InvSnapshotHeader),       27); // v33: +keyKind
+    CHECK_EQ("sizeof(NestedInvKey)",            sizeof(NestedInvKey),            55);
+    CHECK_EQ("sizeof(InvSnapshotHeader)",       sizeof(InvSnapshotHeader),       82); // v46: +nested key
     CHECK_EQ("sizeof(WorldItemEntry)",          sizeof(WorldItemEntry),          73);
     CHECK_EQ("sizeof(WorldItemSnapshotHeader)", sizeof(WorldItemSnapshotHeader), 6);
     CHECK_EQ("sizeof(WorldItemRemoveHeader)",   sizeof(WorldItemRemoveHeader),   6);
@@ -233,7 +234,7 @@ static void testSizes() {
     CHECK_EQ("EVT_SQUAD_MOVE id", (int)EVT_SQUAD_MOVE, 11);
     CHECK("EVT_SQUAD_MOVE distinct", EVT_SQUAD_MOVE != EVT_RECRUIT &&
           EVT_SQUAD_MOVE != EVT_NONE && EVT_SQUAD_MOVE != EVT_EXIT_FURNITURE);
-    CHECK_EQ("PROTOCOL_VERSION (v46: name + animal age + weather sync; local zeroit789 merge adds bounty at PKT_BOUNTY=44, version kept 46)", (int)PROTOCOL_VERSION, 46);
+    CHECK_EQ("PROTOCOL_VERSION (v46: name + animal age + weather sync; local merge adds bounty at PKT_BOUNTY=44 and parent-relative nested inventory, version kept 46)", (int)PROTOCOL_VERSION, 46);
 }
 
 // ---- 2. readPacket / packetType round-trips -----------------------------------
@@ -1310,7 +1311,8 @@ static void testFlushWorldStateContract() {
     // --- Push one sentinel into every WORLD-STATE queue (28).
     in.pushEntity(1, 0, e);
     in.pushEvent(1, ev);
-    in.pushInv(1, 0, cKey, 0, 0);
+    NestedInvKey nested; std::memset(&nested, 0, sizeof(nested));
+    in.pushInv(1, 0, cKey, nested, 0, 0);
     in.pushWorldItems(1, 0, 0);
     in.pushWorldRemove(1, 0, 0);
     in.pushNpcCensus(1, 0, 0, 0);
